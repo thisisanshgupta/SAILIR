@@ -34,6 +34,11 @@ results/                     Benchmark CSVs and training log
 pip install torch numpy matplotlib
 ```
 
+The reducer and classifier also accept `--topology trianglebox` (the default)
+or `--topology box1l`. The box topology has four indices, four IBP actions,
+and three master integrals. Packed data must be prepared and trained with the
+same topology as the records.
+
 ## Quick start
 
 Reduce a single integral with the published checkpoint:
@@ -51,6 +56,11 @@ python scripts/eval/replay_reduction_path.py --path reduction.pkl --prime 1009
 ```
 
 ## End-to-end reproduction
+
+The commands below retain the published triangle-box setup. For box1l, use
+`--topology box1l` consistently for generation, packing, training, and
+evaluation; its local data-generation and Colab workflow are described in the
+box1l training notes once the local multiprocessing generator is available.
 
 ### 1. Generate training data
 

@@ -13,12 +13,12 @@ from pathlib import Path
 # Make the sailir/ package importable from this scripts/eval/ directory.
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'sailir'))
 
-from ibp_env import filter_top_sector, is_master, weight
+from ibp_env import filter_top_sector, is_master, weight, get_sector
 
 
 def get_sector_mask(integral):
     """Return the 6-bit sector mask (list of 0/1) for an integral."""
-    return [1 if integral[i] > 0 else 0 for i in range(6)]
+    return list(get_sector(integral))
 
 
 def filter_to_sector(expr, sector):

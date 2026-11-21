@@ -21,6 +21,7 @@ IBPActionClassifierV5 so the published checkpoint loads without modification.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from topology import get_topology
 
 
 # ---------------------------------------------------------------------------
@@ -29,14 +30,15 @@ import torch.nn.functional as F
 
 class IntegralEncoder(nn.Module):
     """Encode a 7-tuple integral index into a vector, plus explicit weight features."""
-    def __init__(self, embed_dim=64, max_index=20, min_index=-10):
+    def __init__(self, embed_dim=64, max_index=20, min_index=-10, nidx=7):
         super().__init__()
         self.embed_dim = embed_dim
+        self.nidx = nidx
         self.min_index = min_index
         self.num_values = max_index - min_index + 1
 
         self.position_embeds = nn.ModuleList([
-            nn.Embedding(self.num_values, embed_dim // 2) for _ in range(7)
+            nn.Embedding(self.num_values, embed_dim // 2) for _ in range(nidx)
         ])
 
         self.weight_enc = nn.Sequential(
@@ -46,7 +48,7 @@ class IntegralEncoder(nn.Module):
         )
 
         self.combine = nn.Sequential(
-            nn.Linear(7 * (embed_dim // 2) + embed_dim // 2, embed_dim),
+            nn.Linear(nidx * (embed_dim // 2) + embed_dim // 2, embed_dim),
             nn.ReLU(),
             nn.Linear(embed_dim, embed_dim),
         )
@@ -54,10 +56,10 @@ class IntegralEncoder(nn.Module):
     def forward(self, integral):
         shifted = (integral - self.min_index).clamp(0, self.num_values - 1)
         orig_shape = shifted.shape[:-1]
-        shifted_flat = shifted.reshape(-1, 7)
-        integral_flat = integral.reshape(-1, 7).float()
+        shifted_flat = shifted.reshape(-1, self.nidx)
+        integral_flat = integral.reshape(-1, self.nidx).float()
 
-        embeds = [self.position_embeds[i](shifted_flat[:, i]) for i in range(7)]
+        embeds = [self.position_embeds[i](shifted_flat[:, i]) for i in range(self.nidx)]
 
         sum_pos = integral_flat.clamp(min=0).sum(dim=-1, keepdim=True)
         sum_neg = (-integral_flat).clamp(min=0).sum(dim=-1, keepdim=True)
@@ -116,10 +118,10 @@ class CoefficientEncoder(nn.Module):
 
 class ActionEncoder(nn.Module):
     """Encode an action (template index, seed integral delta) into a vector."""
-    def __init__(self, embed_dim=128, n_ibp_ops=9, max_index=20, min_index=-10):
+    def __init__(self, embed_dim=128, n_ibp_ops=9, max_index=20, min_index=-10, nidx=7):
         super().__init__()
         self.ibp_embed = nn.Embedding(n_ibp_ops, embed_dim // 2)
-        self.delta_enc = IntegralEncoder(embed_dim // 2, max_index, min_index)
+        self.delta_enc = IntegralEncoder(embed_dim // 2, max_index, min_index, nidx)
         self.combine = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.ReLU(),
@@ -146,13 +148,14 @@ class FullSubstitutionEncoder(nn.Module):
     through a positional-encoded Transformer + a final attention pool.
     """
     def __init__(self, embed_dim=256, max_index=20, min_index=-10, prime=2147483647,
-                 n_heads=4, n_layers=2, max_subs=50, max_replacement_terms=20):
+                 n_heads=4, n_layers=2, max_subs=50, max_replacement_terms=20, nidx=7):
         super().__init__()
         self.embed_dim = embed_dim
         self.max_replacement_terms = max_replacement_terms
+        self.nidx = nidx
 
-        self.key_integral_enc = IntegralEncoder(embed_dim, max_index, min_index)
-        self.replacement_integral_enc = IntegralEncoder(embed_dim // 2, max_index, min_index)
+        self.key_integral_enc = IntegralEncoder(embed_dim, max_index, min_index, nidx)
+        self.replacement_integral_enc = IntegralEncoder(embed_dim // 2, max_index, min_index, nidx)
         self.replacement_coeff_enc = CoefficientEncoder(embed_dim // 2, prime=prime)
 
         self.replacement_term_proj = nn.Sequential(
@@ -221,8 +224,8 @@ class FullSubstitutionEncoder(nn.Module):
             return torch.zeros(batch_size, self.embed_dim, device=device)
 
         flat_sub_embs = self.encode_single_substitution(
-            sub_keys.view(batch_size * max_subs, 7),
-            sub_repl_ints.view(batch_size * max_subs, max_repl, 7),
+            sub_keys.view(batch_size * max_subs, self.nidx),
+            sub_repl_ints.view(batch_size * max_subs, max_repl, self.nidx),
             sub_repl_coeffs.view(batch_size * max_subs, max_repl),
             sub_repl_mask.view(batch_size * max_subs, max_repl),
         )
@@ -248,20 +251,20 @@ class FullSubstitutionEncoder(nn.Module):
 
 class SectorEncoder(nn.Module):
     """Encode a 6-bit sector mask via per-bit embeddings + MLP."""
-    def __init__(self, embed_dim=256):
+    def __init__(self, embed_dim=256, np=6):
         super().__init__()
         self.position_embeddings = nn.ModuleList([
-            nn.Embedding(2, embed_dim // 6 + 1) for _ in range(6)
+            nn.Embedding(2, embed_dim // 6 + 1) for _ in range(np)
         ])
         self.proj = nn.Sequential(
-            nn.Linear(6 * (embed_dim // 6 + 1), embed_dim),
+            nn.Linear(np * (embed_dim // np + 1), embed_dim),
             nn.GELU(),
             nn.Linear(embed_dim, embed_dim),
             nn.LayerNorm(embed_dim),
         )
 
     def forward(self, sector_mask):
-        pos_embs = [self.position_embeddings[i](sector_mask[:, i].long()) for i in range(6)]
+        pos_embs = [self.position_embeddings[i](sector_mask[:, i].long()) for i in range(len(self.position_embeddings))]
         return self.proj(torch.cat(pos_embs, dim=-1))
 
 
@@ -274,13 +277,13 @@ class TransformerExpressionEncoderWithTarget(nn.Module):
     regular terms use integral+coefficient).
     """
     def __init__(self, embed_dim=256, max_index=20, min_index=-10, prime=2147483647,
-                 n_heads=4, n_layers=2, max_terms=512):
+                 n_heads=4, n_layers=2, max_terms=512, nidx=7):
         super().__init__()
         self.embed_dim = embed_dim
 
-        self.integral_enc = IntegralEncoder(embed_dim // 2, max_index, min_index)
+        self.integral_enc = IntegralEncoder(embed_dim // 2, max_index, min_index, nidx)
         self.coeff_enc = CoefficientEncoder(embed_dim // 2, prime=prime)
-        self.target_integral_enc = IntegralEncoder(embed_dim, max_index, min_index)
+        self.target_integral_enc = IntegralEncoder(embed_dim, max_index, min_index, nidx)
 
         self.term_proj = nn.Sequential(
             nn.Linear(embed_dim, embed_dim), nn.ReLU(),
@@ -408,10 +411,12 @@ class IBPActionClassifier(nn.Module):
     published weights works without modification.
     """
     def __init__(self, embed_dim=256, n_heads=4, n_expr_layers=2, n_cross_layers=2,
-                 n_subs_layers=2, prime=2147483647, **kwargs):
+                 n_subs_layers=2, prime=2147483647, topology="trianglebox", **kwargs):
         super().__init__()
         self.prime = prime
         self.embed_dim = embed_dim
+        topo = get_topology(topology); self.topology = topo.name
+        kwargs.update(nidx=topo.nidx, n_ibp_ops=topo.n_templates)
 
         self.expr_enc = TransformerExpressionEncoderWithTarget(
             embed_dim, prime=prime, n_heads=n_heads, n_layers=n_expr_layers, **kwargs,
@@ -419,7 +424,7 @@ class IBPActionClassifier(nn.Module):
         self.subs_enc = FullSubstitutionEncoder(
             embed_dim, n_heads=n_heads, n_layers=n_subs_layers, prime=prime, **kwargs,
         )
-        self.sector_enc = SectorEncoder(embed_dim)
+        self.sector_enc = SectorEncoder(embed_dim, topo.np)
         self.action_enc = ActionEncoder(embed_dim, **kwargs)
 
         # State combine: cls + target + subs + sector -> embed_dim

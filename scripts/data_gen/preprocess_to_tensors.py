@@ -20,7 +20,7 @@ from pathlib import Path
 import torch
 
 
-def load_and_convert(input_path, max_samples=None):
+def load_and_convert(input_path, max_samples=None, nidx=7):
     """Load JSONL and convert to lists of tensors. KEEPS ALL FIELDS."""
     samples = []
 
@@ -51,7 +51,7 @@ def load_and_convert(input_path, max_samples=None):
 
                 # === SUBSTITUTIONS (complex structure: [integral, [[integral,coeff],...]] for each) ===
                 # Store the integral being substituted
-                'sub_integrals': torch.tensor([t[0] for t in subs], dtype=torch.int8) if subs else torch.zeros(0, 7, dtype=torch.int8),
+                'sub_integrals': torch.tensor([t[0] for t in subs], dtype=torch.int8) if subs else torch.zeros(0, nidx, dtype=torch.int8),
                 # Store the full substitution expressions as raw JSON (can't easily tensorize)
                 'subs_raw': subs,
 
@@ -63,7 +63,7 @@ def load_and_convert(input_path, max_samples=None):
                 # === LABEL ===
                 # chosen_action is [ibp_op, [delta...]] - store as ibp_op and delta separately
                 'chosen_action_ibp_op': s['chosen_action'][0] if 'chosen_action' in s else (actions[s['chosen_action_idx']][0] if actions else 0),
-                'chosen_action_delta': torch.tensor(s['chosen_action'][1] if 'chosen_action' in s else (actions[s['chosen_action_idx']][1] if actions else [0]*7), dtype=torch.int8),
+                'chosen_action_delta': torch.tensor(s['chosen_action'][1] if 'chosen_action' in s else (actions[s['chosen_action_idx']][1] if actions else [0]*nidx), dtype=torch.int8),
                 'label': s['chosen_action_idx'],
             })
 
@@ -73,7 +73,7 @@ def load_and_convert(input_path, max_samples=None):
     return samples
 
 
-def pack_samples(samples):
+def pack_samples(samples, nidx=7):
     """Pack variable-length samples into flat arrays with offsets. KEEPS ALL FIELDS."""
 
     # Collect all data
@@ -146,18 +146,18 @@ def pack_samples(samples):
         'target_weights': torch.stack(all_target_weights),
 
         # === EXPRESSION ===
-        'expr_integrals': torch.cat(all_expr_integrals) if all_expr_integrals else torch.zeros(0, 7, dtype=torch.int8),
+        'expr_integrals': torch.cat(all_expr_integrals) if all_expr_integrals else torch.zeros(0, nidx, dtype=torch.int8),
         'expr_coeffs': torch.cat(all_expr_coeffs) if all_expr_coeffs else torch.zeros(0, dtype=torch.int16),
         'expr_offsets': torch.tensor(expr_offsets, dtype=torch.int32),
 
         # === SUBSTITUTIONS ===
-        'sub_integrals': torch.cat(all_sub_integrals) if any(len(s) > 0 for s in all_sub_integrals) else torch.zeros(0, 7, dtype=torch.int8),
+        'sub_integrals': torch.cat(all_sub_integrals) if any(len(s) > 0 for s in all_sub_integrals) else torch.zeros(0, nidx, dtype=torch.int8),
         'sub_offsets': torch.tensor(sub_offsets, dtype=torch.int32),
         'subs_raw': all_subs_raw,  # Full substitution expressions (list of lists)
 
         # === ACTIONS ===
         'action_ibp_ops': torch.cat(all_action_ibp_ops) if all_action_ibp_ops else torch.zeros(0, dtype=torch.int8),
-        'action_deltas': torch.cat(all_action_deltas) if all_action_deltas else torch.zeros(0, 7, dtype=torch.int8),
+        'action_deltas': torch.cat(all_action_deltas) if all_action_deltas else torch.zeros(0, nidx, dtype=torch.int8),
         'action_offsets': torch.tensor(action_offsets, dtype=torch.int32),
         'num_valid_actions': torch.tensor(all_num_valid_actions, dtype=torch.int16),
 
@@ -168,14 +168,17 @@ def pack_samples(samples):
     }
 
 
-def preprocess(input_path, output_dir, val_split=0.1, test_split=0.1, seed=42):
+def preprocess(input_path, output_dir, val_split=0.1, test_split=0.1, seed=42, topology='trianglebox'):
     """Preprocess JSONL to packed tensor files."""
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading samples from {input_path}...", flush=True)
-    samples = load_and_convert(input_path)
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'sailir'))
+    from topology import get_topology
+    samples = load_and_convert(input_path, nidx=get_topology(topology).nidx)
     n_total = len(samples)
     print(f"Total samples: {n_total}", flush=True)
 
@@ -197,7 +200,7 @@ def preprocess(input_path, output_dir, val_split=0.1, test_split=0.1, seed=42):
     # Pack and save each split
     print("Packing and saving splits...", flush=True)
     for name, split_samples in splits.items():
-        packed = pack_samples(split_samples)
+        packed = pack_samples(split_samples, get_topology(topology).nidx)
         path = output_dir / f'{name}.pt'
         torch.save(packed, path)
         size_mb = path.stat().st_size / 1e6
@@ -209,6 +212,7 @@ def preprocess(input_path, output_dir, val_split=0.1, test_split=0.1, seed=42):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--topology', choices=['trianglebox','box1l'], default='trianglebox')
     parser.add_argument('--input', type=str, required=True)
     parser.add_argument('--output_dir', type=str, required=True)
     parser.add_argument('--val_split', type=float, default=0.1)
@@ -223,7 +227,7 @@ def main():
         print(f"  {k}: {v}", flush=True)
     print(flush=True)
 
-    preprocess(args.input, args.output_dir, args.val_split, args.test_split, args.seed)
+    preprocess(args.input, args.output_dir, args.val_split, args.test_split, args.seed, args.topology)
 
 
 if __name__ == '__main__':

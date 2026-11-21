@@ -12,9 +12,16 @@ Use set_prime(p) to change from default (2147483647).
 Smaller primes like 1009 make coefficients more learnable.
 """
 
-import re
+import ast
 import torch
 from pathlib import Path
+from topology import get_topology, vanishes
+
+TOPOLOGY = get_topology()
+def set_topology(topology):
+    global TOPOLOGY, KINEMATICS
+    TOPOLOGY = get_topology(topology)
+    KINEMATICS = dict(TOPOLOGY.kinematics)
 
 # Default prime - can be changed with set_prime()
 PRIME = 2147483647
@@ -84,21 +91,43 @@ def parse_templates(path):
         templates[current] = terms
     return templates
 
+def build_box_templates():
+    """Build the four massless-box IBP vectors directly from the stated identity."""
+    out = {}
+    opposite = {(0, 2): 's', (2, 0): 's', (1, 3): 't', (3, 1): 't'}
+    for j in range(4):
+        terms = []
+        shift = [0]*4
+        terms.append((tuple(shift), f"d - 2*a{j} - (" + " + ".join(f"a{i}" for i in range(4) if i != j) + ")"))
+        for i in range(4):
+            if i == j: continue
+            sh=[0]*4; sh[i]=1; sh[j]=-1
+            terms.append((tuple(sh), f"-a{i}"))
+            if (i,j) in opposite:
+                sh=[0]*4; sh[i]=1
+                terms.append((tuple(sh), f"{opposite[i,j]}*a{i}"))
+        out[j]=terms
+    return out
+
 
 def eval_coeff(coeff_str, seed):
     """Evaluate coefficient expression with given seed."""
-    a0, a1, a2, a3, a4, a5, a6 = seed
+    if len(seed) != TOPOLOGY.nidx:
+        raise ValueError(f"Expected {TOPOLOGY.nidx} indices, got {len(seed)}")
     d = KINEMATICS['d']
-    m1, m2, m3 = KINEMATICS['m1'], KINEMATICS['m2'], KINEMATICS['m3']
-    try:
-        return eval(coeff_str.replace('^', '**')) % PRIME
-    except:
-        return 0
+    scope = {f'a{i}': int(x) for i,x in enumerate(seed)}
+    scope.update({k:int(v) for k,v in KINEMATICS.items()})
+    tree = ast.parse(coeff_str.replace('^', '**'), mode='eval')
+    allowed=(ast.Expression,ast.BinOp,ast.UnaryOp,ast.Add,ast.Sub,ast.Mult,ast.Div,ast.Pow,ast.USub,ast.UAdd,ast.Constant,ast.Name,ast.Mod)
+    if any(not isinstance(n, allowed) for n in ast.walk(tree)): raise ValueError("Unsafe coefficient expression")
+    return int(eval(compile(tree, '<ibp coefficient>', 'eval'), {'__builtins__':{}}, scope)) % PRIME
 
 
 def get_raw_equation(ibp_t, li_t, ibp_op, seed):
     """Get raw IBP equation for given operator and seed."""
-    if ibp_op >= 8:
+    if TOPOLOGY.name == 'box1l':
+        template = ibp_t.get(ibp_op, [])
+    elif ibp_op >= 8:
         template = li_t.get(ibp_op - 8, [])
     else:
         template = ibp_t.get(ibp_op, [])
@@ -106,8 +135,8 @@ def get_raw_equation(ibp_t, li_t, ibp_op, seed):
     for shift, coeff_str in template:
         c = eval_coeff(coeff_str, seed)
         if c != 0:
-            integral = tuple(seed[i] + shift[i] for i in range(7))
-            eq[integral] = c
+            integral = tuple(seed[i] + shift[i] for i in range(TOPOLOGY.nidx))
+            if not vanishes(TOPOLOGY, integral): eq[integral] = (eq.get(integral, 0) + c) % PRIME
     return eq
 
 
@@ -261,6 +290,7 @@ def solve_ibp_for(ibp, target):
 
 
 def is_top_sector(i):
+    if TOPOLOGY.name == 'box1l': return True
     return i[0] >= 1 and i[2] >= 1 and i[4] >= 1 and i[5] >= 1
 
 
@@ -287,7 +317,7 @@ PAPER_MASTERS = frozenset([
 
 def get_sector(integral):
     """Get the sector mask for an integral (first 6 indices)."""
-    return tuple(1 if integral[j] > 0 else 0 for j in range(6))
+    return tuple(1 if integral[j] > 0 else 0 for j in range(TOPOLOGY.np))
 
 
 # Sectors covered by the paper masters
@@ -312,12 +342,12 @@ def is_corner_integral(integral):
     - All positive indices in positions 0-5 equal to exactly 1
     - No numerator power (position 6 = 0)
     """
-    for j in range(6):
+    for j in range(TOPOLOGY.np):
         if integral[j] > 1:
             return False
         if integral[j] < 0:
             return False
-    if integral[6] != 0:
+    if any(integral[TOPOLOGY.np:]):
         return False
     return True
 
@@ -347,11 +377,15 @@ def is_master(i):
 
 
 def is_higher_sector(i):
+    if TOPOLOGY.name == 'box1l':
+        return False
     # TODO: This is hardcoded for sector 53 (top sector = positions 0,2,4,5).
     # It checks if integral is in top sector AND has extra propagators at 1, 3, or 6.
     # If used for other sectors, this logic would need to be generalized.
     # Currently only used by filter_mode='higher_only' which is deprecated.
-    return is_top_sector(i) and (i[1] >= 1 or i[3] >= 1 or i[6] >= 1)
+    top_positions = {0, 2, 4, 5} if TOPOLOGY.name == 'trianglebox' else set(range(TOPOLOGY.np))
+    return is_top_sector(i) and (any(i[j] >= 1 for j in range(TOPOLOGY.np) if j not in top_positions)
+                                 or any(x >= 1 for x in i[TOPOLOGY.np:]))
 
 
 def weight(i):
@@ -380,7 +414,7 @@ def is_subsector(integral, target):
     is also on in B. In other words, A can only have propagators where B has them.
     This includes the ISP (index 6).
     """
-    for i in range(7):  # Check all 7 indices including ISP
+    for i in range(TOPOLOGY.nidx):  # Check all 7 indices including ISP
         if target[i] <= 0 and integral[i] > 0:
             return False
     return True
@@ -408,7 +442,7 @@ def integral_in_exact_sector(integral, target_sector):
     Returns:
         True if integral's sector mask exactly matches target_sector
     """
-    for i in range(6):
+    for i in range(TOPOLOGY.np):
         integral_has_prop = integral[i] > 0
         target_has_prop = target_sector[i] == 1
         if integral_has_prop != target_has_prop:
@@ -428,7 +462,7 @@ def integral_in_sector_or_subsector(integral, target_sector):
     """
     # Check first 6 indices (propagators) - integral can only have propagators
     # where target_sector has them (subsector condition)
-    for i in range(6):
+    for i in range(TOPOLOGY.np):
         # If target_sector has this propagator OFF (0) but integral has it ON (>0),
         # then integral is in a different/higher sector
         if target_sector[i] == 0 and integral[i] > 0:
@@ -538,12 +572,12 @@ def action_introduces_higher_sector_general(cached_eq, target):
         True if any integral is in a strictly higher sector than target
     """
     # Get target's sector mask (which propagators are >= 1)
-    target_mask = tuple(1 if target[i] >= 1 else 0 for i in range(6))
+    target_mask = tuple(1 if target[i] >= 1 else 0 for i in range(TOPOLOGY.np))
 
     for integral in cached_eq.keys():
         # First check if integral is "in the sector" - has all required propagators
         in_sector = True
-        for i in range(6):
+        for i in range(TOPOLOGY.np):
             if target_mask[i] == 1 and integral[i] < 1:
                 in_sector = False
                 break
@@ -552,11 +586,11 @@ def action_introduces_higher_sector_general(cached_eq, target):
             continue  # Skip integrals not in sector (lateral sectors are OK)
 
         # Now check if it's a HIGHER sector (has extra propagators)
-        for i in range(6):
+        for i in range(TOPOLOGY.np):
             if target_mask[i] == 0 and integral[i] >= 1:
                 return True  # Higher sector - has extra propagator
         # Also check ISP (index 6) - if integral has ISP, it's higher
-        if integral[6] >= 1:
+        if any(x >= 1 for x in integral[TOPOLOGY.np:]):
             return True
     return False
 
@@ -584,7 +618,7 @@ def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, filter_mode='subs
     # Direct actions
     for ibp_op, shift_list in shifts.items():
         for shift in shift_list:
-            seed = tuple(target[i] - shift[i] for i in range(7))
+            seed = tuple(target[i] - shift[i] for i in range(TOPOLOGY.nidx))
             raw = get_raw_equation(ibp_t, li_t, ibp_op, seed)
             if target not in raw or raw[target] == 0:
                 continue
@@ -593,7 +627,7 @@ def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, filter_mode='subs
                 continue
             if should_filter(cached, target):
                 continue
-            delta = tuple(seed[i] - target[i] for i in range(7))
+            delta = tuple(seed[i] - target[i] for i in range(TOPOLOGY.nidx))
             if (ibp_op, delta) not in seen:
                 seen.add((ibp_op, delta))
                 valid.append((ibp_op, delta))
@@ -602,7 +636,7 @@ def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, filter_mode='subs
     for sub_int in subs:
         for ibp_op, shift_list in shifts.items():
             for shift in shift_list:
-                seed = tuple(sub_int[i] - shift[i] for i in range(7))
+                seed = tuple(sub_int[i] - shift[i] for i in range(TOPOLOGY.nidx))
                 raw = get_raw_equation(ibp_t, li_t, ibp_op, seed)
                 if sub_int not in raw or raw[sub_int] == 0:
                     continue
@@ -613,7 +647,7 @@ def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, filter_mode='subs
                     continue
                 if should_filter(cached, target):
                     continue
-                delta = tuple(seed[i] - target[i] for i in range(7))
+                delta = tuple(seed[i] - target[i] for i in range(TOPOLOGY.nidx))
                 if (ibp_op, delta) not in seen:
                     seen.add((ibp_op, delta))
                     valid.append((ibp_op, delta))
@@ -649,7 +683,7 @@ def enumerate_valid_actions_cached(target, subs, ibp_t, li_t, shifts, filter_mod
     # Direct actions
     for ibp_op, shift_list in shifts.items():
         for shift in shift_list:
-            seed = tuple(target[i] - shift[i] for i in range(7))
+            seed = tuple(target[i] - shift[i] for i in range(TOPOLOGY.nidx))
             raw = get_raw_cached(ibp_op, seed)
             if target not in raw or raw[target] == 0:
                 continue
@@ -658,7 +692,7 @@ def enumerate_valid_actions_cached(target, subs, ibp_t, li_t, shifts, filter_mod
                 continue
             if should_filter(cached, target):
                 continue
-            delta = tuple(seed[i] - target[i] for i in range(7))
+            delta = tuple(seed[i] - target[i] for i in range(TOPOLOGY.nidx))
             if (ibp_op, delta) not in seen:
                 seen.add((ibp_op, delta))
                 valid.append((ibp_op, delta))
@@ -667,7 +701,7 @@ def enumerate_valid_actions_cached(target, subs, ibp_t, li_t, shifts, filter_mod
     for sub_int in subs:
         for ibp_op, shift_list in shifts.items():
             for shift in shift_list:
-                seed = tuple(sub_int[i] - shift[i] for i in range(7))
+                seed = tuple(sub_int[i] - shift[i] for i in range(TOPOLOGY.nidx))
                 raw = get_raw_cached(ibp_op, seed)
                 if sub_int not in raw or raw[sub_int] == 0:
                     continue
@@ -678,7 +712,7 @@ def enumerate_valid_actions_cached(target, subs, ibp_t, li_t, shifts, filter_mod
                     continue
                 if should_filter(cached, target):
                     continue
-                delta = tuple(seed[i] - target[i] for i in range(7))
+                delta = tuple(seed[i] - target[i] for i in range(TOPOLOGY.nidx))
                 if (ibp_op, delta) not in seen:
                     seen.add((ibp_op, delta))
                     valid.append((ibp_op, delta))
@@ -717,7 +751,7 @@ def enumerate_valid_actions_resolved(target, subs, resolved_subs, ibp_t, li_t, s
     # Direct actions
     for ibp_op, shift_list in shifts.items():
         for shift in shift_list:
-            seed = tuple(target[i] - shift[i] for i in range(7))
+            seed = tuple(target[i] - shift[i] for i in range(TOPOLOGY.nidx))
             raw = get_raw_cached(ibp_op, seed)
             if target not in raw or raw[target] == 0:
                 continue
@@ -727,7 +761,7 @@ def enumerate_valid_actions_resolved(target, subs, resolved_subs, ibp_t, li_t, s
                 continue
             if should_filter(cached, target):
                 continue
-            delta = tuple(seed[i] - target[i] for i in range(7))
+            delta = tuple(seed[i] - target[i] for i in range(TOPOLOGY.nidx))
             if (ibp_op, delta) not in seen:
                 seen.add((ibp_op, delta))
                 valid.append((ibp_op, delta))
@@ -736,7 +770,7 @@ def enumerate_valid_actions_resolved(target, subs, resolved_subs, ibp_t, li_t, s
     for sub_int in subs:
         for ibp_op, shift_list in shifts.items():
             for shift in shift_list:
-                seed = tuple(sub_int[i] - shift[i] for i in range(7))
+                seed = tuple(sub_int[i] - shift[i] for i in range(TOPOLOGY.nidx))
                 raw = get_raw_cached(ibp_op, seed)
                 if sub_int not in raw or raw[sub_int] == 0:
                     continue
@@ -748,7 +782,7 @@ def enumerate_valid_actions_resolved(target, subs, resolved_subs, ibp_t, li_t, s
                     continue
                 if should_filter(cached, target):
                     continue
-                delta = tuple(seed[i] - target[i] for i in range(7))
+                delta = tuple(seed[i] - target[i] for i in range(TOPOLOGY.nidx))
                 if (ibp_op, delta) not in seen:
                     seen.add((ibp_op, delta))
                     valid.append((ibp_op, delta))
@@ -860,7 +894,7 @@ def compute_indirect_substituted(subs, resolved_subs, ibp_t, li_t, shifts, raw_e
             raw_list = []
             for ibp_op, shift_list in shifts.items():
                 for shift in shift_list:
-                    seed = tuple(sub_int[i] - shift[i] for i in range(7))
+                    seed = tuple(sub_int[i] - shift[i] for i in range(TOPOLOGY.nidx))
                     raw = get_raw_cached(ibp_op, seed)
                     if sub_int in raw and raw[sub_int] != 0:
                         raw_list.append((ibp_op, shift, raw))
@@ -936,7 +970,7 @@ def enumerate_valid_actions_with_indirect_cache(target, indirect_cache, subs, re
 
     for ibp_op, shift_list in shifts.items():
         for shift in shift_list:
-            seed = tuple(target[i] - shift[i] for i in range(7))
+            seed = tuple(target[i] - shift[i] for i in range(TOPOLOGY.nidx))
             raw = get_raw_cached(ibp_op, seed)
             if target not in raw or raw[target] == 0:
                 continue
@@ -946,7 +980,7 @@ def enumerate_valid_actions_with_indirect_cache(target, indirect_cache, subs, re
                 continue
             if should_filter(cached, target):
                 continue
-            delta = tuple(seed[i] - target[i] for i in range(7))
+            delta = tuple(seed[i] - target[i] for i in range(TOPOLOGY.nidx))
             if (ibp_op, delta) not in seen:
                 seen.add((ibp_op, delta))
                 valid.append((ibp_op, delta))
@@ -968,8 +1002,8 @@ def enumerate_valid_actions_with_indirect_cache(target, indirect_cache, subs, re
         # Check sector filter
         if should_filter(cached, target):
             continue
-        seed = tuple(sub_int[i] - shift[i] for i in range(7))
-        delta = tuple(seed[i] - target[i] for i in range(7))
+        seed = tuple(sub_int[i] - shift[i] for i in range(TOPOLOGY.nidx))
+        delta = tuple(seed[i] - target[i] for i in range(TOPOLOGY.nidx))
         if (ibp_op, delta) not in seen:
             seen.add((ibp_op, delta))
             valid.append((ibp_op, delta))
@@ -1034,11 +1068,11 @@ def enumerate_valid_actions_batched(target, subs, resolved_subs, ibp_t, li_t, sh
     for ibp_op, shift_list in shifts.items():
         for shift in shift_list:
             n_direct_checked += 1
-            seed = tuple(target[i] - shift[i] for i in range(7))
+            seed = tuple(target[i] - shift[i] for i in range(TOPOLOGY.nidx))
             raw = get_raw_cached(ibp_op, seed)
             if target not in raw or raw[target] == 0:
                 continue
-            delta = tuple(seed[i] - target[i] for i in range(7))
+            delta = tuple(seed[i] - target[i] for i in range(TOPOLOGY.nidx))
             candidates.append((ibp_op, delta, raw))
             n_direct_found += 1
     t1a_elapsed = _time.time() - t1a
@@ -1069,7 +1103,7 @@ def enumerate_valid_actions_batched(target, subs, resolved_subs, ibp_t, li_t, sh
             raw_list = []
             for ibp_op, shift_list in shifts.items():
                 for shift in shift_list:
-                    seed = tuple(sub_int[i] - shift[i] for i in range(7))
+                    seed = tuple(sub_int[i] - shift[i] for i in range(TOPOLOGY.nidx))
                     raw = get_raw_cached(ibp_op, seed)
                     if sub_int in raw and raw[sub_int] != 0:
                         raw_list.append((ibp_op, shift, raw))
@@ -1080,8 +1114,8 @@ def enumerate_valid_actions_batched(target, subs, resolved_subs, ibp_t, li_t, sh
             n_indirect_checked += 1
             if target in raw and raw[target] != 0:
                 continue
-            seed = tuple(sub_int[i] - shift[i] for i in range(7))
-            delta = tuple(seed[i] - target[i] for i in range(7))
+            seed = tuple(sub_int[i] - shift[i] for i in range(TOPOLOGY.nidx))
+            delta = tuple(seed[i] - target[i] for i in range(TOPOLOGY.nidx))
             candidates.append((ibp_op, delta, raw))
             n_indirect_found += 1
     t1b_elapsed = _time.time() - t1b
@@ -1140,12 +1174,12 @@ class IBPEnvironment:
     """Environment for IBP reduction with model-based action selection."""
 
     def __init__(self, ibp_path=None, li_path=None):
-        self.ibp_t = parse_templates(ibp_path or IBP_PATH)
-        self.li_t = parse_templates(li_path or LI_PATH)
+        self.ibp_t = build_box_templates() if TOPOLOGY.name == 'box1l' else parse_templates(ibp_path or IBP_PATH)
+        self.li_t = {} if TOPOLOGY.name == 'box1l' else parse_templates(li_path or LI_PATH)
 
         # Build shifts lookup
         self.shifts = {}
-        for ibp_op in range(8):
+        for ibp_op in range(TOPOLOGY.n_templates if TOPOLOGY.name == 'box1l' else 8):
             if ibp_op in self.ibp_t:
                 self.shifts[ibp_op] = [s for s, _ in self.ibp_t[ibp_op]]
         for li_idx in self.li_t:
@@ -1231,7 +1265,7 @@ class IBPEnvironment:
         Returns:
             (new_expr, new_subs, success)
         """
-        seed = tuple(target[i] + delta[i] for i in range(7))
+        seed = tuple(target[i] + delta[i] for i in range(TOPOLOGY.nidx))
         raw = get_raw_equation(self.ibp_t, self.li_t, ibp_op, seed)
         cached = apply_all_substitutions(raw, subs)
 
@@ -1256,7 +1290,7 @@ class IBPEnvironment:
         Returns:
             (new_expr, new_subs, new_resolved_subs, success)
         """
-        seed = tuple(target[i] + delta[i] for i in range(7))
+        seed = tuple(target[i] + delta[i] for i in range(TOPOLOGY.nidx))
         raw = get_raw_equation(self.ibp_t, self.li_t, ibp_op, seed)
         # Use single-pass application
         cached = apply_resolved_subs(raw, resolved_subs)
@@ -1372,7 +1406,7 @@ class IBPEnvironment:
         max_actions = 900
 
         # Expression
-        expr_integrals = torch.zeros(1, max_terms, 7, dtype=torch.long)
+        expr_integrals = torch.zeros(1, max_terms, TOPOLOGY.nidx, dtype=torch.long)
         expr_coeffs = torch.zeros(1, max_terms, dtype=torch.long)
         expr_mask = torch.zeros(1, max_terms, dtype=torch.bool)
 
@@ -1383,7 +1417,7 @@ class IBPEnvironment:
             expr_mask[0, j] = True
 
         # Substitutions
-        sub_integrals = torch.zeros(1, max_subs, 7, dtype=torch.long)
+        sub_integrals = torch.zeros(1, max_subs, TOPOLOGY.nidx, dtype=torch.long)
         sub_mask = torch.zeros(1, max_subs, dtype=torch.bool)
 
         for j, integral in enumerate(list(subs.keys())[:max_subs]):
@@ -1392,7 +1426,7 @@ class IBPEnvironment:
 
         # Actions
         action_ibp_ops = torch.zeros(1, max_actions, dtype=torch.long)
-        action_deltas = torch.zeros(1, max_actions, 7, dtype=torch.long)
+        action_deltas = torch.zeros(1, max_actions, TOPOLOGY.nidx, dtype=torch.long)
         action_mask = torch.zeros(1, max_actions, dtype=torch.bool)
 
         for j, (ibp_op, delta) in enumerate(valid_actions[:max_actions]):

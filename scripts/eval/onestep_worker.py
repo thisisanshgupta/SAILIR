@@ -40,7 +40,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'sailir'))
 
 import torch
-from ibp_env import IBPEnvironment, set_prime, set_paper_masters_only, is_master, weight
+from ibp_env import IBPEnvironment, set_prime, set_paper_masters_only, set_topology, is_master, weight
 from beam_search import beam_search
 from beam_search_utils import get_sector_mask, max_weight
 from classifier import IBPActionClassifier
@@ -60,10 +60,12 @@ def get_non_masters_in_sector(expr, target_sector):
     return result
 
 
-def load_model(checkpoint_path, device='cpu'):
+def load_model(checkpoint_path, device='cpu', expected_topology='trianglebox'):
     """Load the classifier model."""
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model = IBPActionClassifier(prime=checkpoint['args']['prime'])
+    topology = checkpoint.get('topology', checkpoint.get('args', {}).get('topology', 'trianglebox'))
+    if topology != expected_topology: raise ValueError(f'Checkpoint topology {topology!r} does not match requested {expected_topology!r}')
+    model = IBPActionClassifier(prime=checkpoint['args']['prime'], topology=topology)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
     model.eval()
@@ -84,6 +86,8 @@ def main():
                         help='Max steps for beam search (effectively unlimited)')
     parser.add_argument('--prime', type=int, default=1009,
                         help='Prime for modular arithmetic')
+    parser.add_argument('--topology', choices=['trianglebox','box1l'], default='trianglebox')
+    parser.add_argument('--box-masters-only', action='store_true')
     parser.add_argument('--device', type=str, default='cpu',
                         help='Device (cpu or cuda)')
     parser.add_argument('-v', '--verbose', action='store_true',
@@ -103,7 +107,11 @@ def main():
 
     # Setup
     set_prime(args.prime)
+    set_topology(args.topology)
     set_paper_masters_only(args.paper_masters_only)
+    if args.box_masters_only:
+        if args.topology != 'box1l': raise ValueError('--box-masters-only requires --topology box1l')
+        set_paper_masters_only(True)
     env = IBPEnvironment()
 
     # Parse integral (strip quotes that may be passed from Condor)
@@ -114,7 +122,7 @@ def main():
     if args.verbose:
         print(f"Loading model from {args.model_checkpoint}")
 
-    model = load_model(args.model_checkpoint, args.device)
+    model = load_model(args.model_checkpoint, args.device, args.topology)
 
     # Start with just this integral
     start_expr = {integral: 1}

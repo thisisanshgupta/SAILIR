@@ -21,6 +21,7 @@ from torch.utils.data import Dataset, DataLoader
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'sailir'))
 from classifier import IBPActionClassifier
+from topology import get_topology
 
 
 class PackedDatasetV5(Dataset):
@@ -55,7 +56,7 @@ class PackedDatasetV5(Dataset):
 
 MAX_REPLACEMENT_TERMS = 20  # Max replacement terms per substitution
 
-def collate_fn(samples):
+def collate_fn(samples, nidx=7, np=6):
     """Pad variable-length tensors to batch max and stack."""
     batch_size = len(samples)
 
@@ -63,23 +64,23 @@ def collate_fn(samples):
     max_sub = max(len(s['subs_raw']) for s in samples) if any(len(s['subs_raw']) > 0 for s in samples) else 1
     max_action = max(len(s['action_ibp_ops']) for s in samples)
 
-    expr_integrals = torch.zeros(batch_size, max_expr, 7, dtype=torch.long)
+    expr_integrals = torch.zeros(batch_size, max_expr, nidx, dtype=torch.long)
     expr_coeffs = torch.zeros(batch_size, max_expr, dtype=torch.long)
     expr_mask = torch.zeros(batch_size, max_expr, dtype=torch.bool)
 
     # Batched substitution tensors
-    sub_keys = torch.zeros(batch_size, max_sub, 7, dtype=torch.long)
-    sub_repl_ints = torch.zeros(batch_size, max_sub, MAX_REPLACEMENT_TERMS, 7, dtype=torch.long)
+    sub_keys = torch.zeros(batch_size, max_sub, nidx, dtype=torch.long)
+    sub_repl_ints = torch.zeros(batch_size, max_sub, MAX_REPLACEMENT_TERMS, nidx, dtype=torch.long)
     sub_repl_coeffs = torch.zeros(batch_size, max_sub, MAX_REPLACEMENT_TERMS, dtype=torch.long)
     sub_repl_mask = torch.zeros(batch_size, max_sub, MAX_REPLACEMENT_TERMS, dtype=torch.bool)
     sub_mask = torch.zeros(batch_size, max_sub, dtype=torch.bool)
 
     action_ibp_ops = torch.zeros(batch_size, max_action, dtype=torch.long)
-    action_deltas = torch.zeros(batch_size, max_action, 7, dtype=torch.long)
+    action_deltas = torch.zeros(batch_size, max_action, nidx, dtype=torch.long)
     action_mask = torch.zeros(batch_size, max_action, dtype=torch.bool)
 
-    sector_masks = torch.zeros(batch_size, 6, dtype=torch.long)
-    target_integrals = torch.zeros(batch_size, 7, dtype=torch.long)
+    sector_masks = torch.zeros(batch_size, np, dtype=torch.long)
+    target_integrals = torch.zeros(batch_size, nidx, dtype=torch.long)
     labels = torch.zeros(batch_size, dtype=torch.long)
 
     for i, s in enumerate(samples):
@@ -194,6 +195,7 @@ def evaluate(model, dataloader, device):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--topology', choices=['trianglebox','box1l'], default='trianglebox')
     parser.add_argument('--data_dir', type=str, required=True, help='Directory with train.pt, val.pt')
     parser.add_argument('--output_dir', type=str, default='checkpoints')
     parser.add_argument('--epochs', type=int, default=30)
@@ -210,6 +212,7 @@ def main():
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--resume', type=str, default=None)
     args = parser.parse_args()
+    topology = get_topology(args.topology)
 
     print("=" * 70, flush=True)
     print("IBP Action Classifier v5 Training", flush=True)
@@ -240,9 +243,9 @@ def main():
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}", flush=True)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                              collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True)
+                              collate_fn=lambda batch: collate_fn(batch, topology.nidx, topology.np), num_workers=args.num_workers, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
-                            collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True)
+                            collate_fn=lambda batch: collate_fn(batch, topology.nidx, topology.np), num_workers=args.num_workers, pin_memory=True)
 
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}", flush=True)
 
@@ -253,7 +256,7 @@ def main():
     model = IBPActionClassifier(
         embed_dim=args.embed_dim, n_heads=args.n_heads,
         n_expr_layers=args.n_expr_layers, n_cross_layers=args.n_cross_layers,
-        n_subs_layers=args.n_subs_layers, prime=args.prime
+        n_subs_layers=args.n_subs_layers, prime=args.prime, topology=args.topology
     )
     model = model.to(args.device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}", flush=True)
@@ -277,6 +280,7 @@ def main():
     start_epoch, best_val_loss = 1, float('inf')
     if args.resume:
         ckpt = torch.load(args.resume, weights_only=False)
+        if ckpt.get('topology', ckpt.get('args', {}).get('topology', 'trianglebox')) != args.topology: raise ValueError('Checkpoint topology mismatch')
         base_model.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         start_epoch = ckpt['epoch'] + 1
@@ -300,17 +304,17 @@ def main():
             best_val_loss = val_m['loss']
             torch.save({'epoch': epoch, 'model_state_dict': base_model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(), 'val_metrics': val_m,
-                        'args': vars(args)}, output_dir / 'best_model.pt')
+                        'args': vars(args), 'topology': args.topology, 'topology_config': {'np': topology.np, 'n_isp': topology.n_isp, 'nidx': topology.nidx, 'n_templates': topology.n_templates, 'masters': [list(x) for x in topology.masters]}}, output_dir / 'best_model.pt')
             print(f"  -> New best val loss! Saved.", flush=True)
 
         if epoch % 5 == 0:
             torch.save({'epoch': epoch, 'model_state_dict': base_model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(), 'val_metrics': val_m,
-                        'args': vars(args)}, output_dir / f'checkpoint_epoch{epoch}.pt')
+                        'args': vars(args), 'topology': args.topology, 'topology_config': {'np': topology.np, 'n_isp': topology.n_isp, 'nidx': topology.nidx, 'n_templates': topology.n_templates, 'masters': [list(x) for x in topology.masters]}}, output_dir / f'checkpoint_epoch{epoch}.pt')
 
     torch.save({'epoch': args.epochs, 'model_state_dict': base_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(), 'val_metrics': val_m,
-                'args': vars(args)}, output_dir / 'final_model.pt')
+                'args': vars(args), 'topology': args.topology, 'topology_config': {'np': topology.np, 'n_isp': topology.n_isp, 'nidx': topology.nidx, 'n_templates': topology.n_templates, 'masters': [list(x) for x in topology.masters]}}, output_dir / 'final_model.pt')
 
     print(f"\nTraining complete! Best val loss: {best_val_loss:.4f}", flush=True)
 
