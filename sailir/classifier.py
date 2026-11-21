@@ -254,7 +254,7 @@ class SectorEncoder(nn.Module):
     def __init__(self, embed_dim=256, np=6):
         super().__init__()
         self.position_embeddings = nn.ModuleList([
-            nn.Embedding(2, embed_dim // 6 + 1) for _ in range(np)
+            nn.Embedding(2, embed_dim // np + 1) for _ in range(np)
         ])
         self.proj = nn.Sequential(
             nn.Linear(np * (embed_dim // np + 1), embed_dim),
@@ -416,7 +416,7 @@ class IBPActionClassifier(nn.Module):
         self.prime = prime
         self.embed_dim = embed_dim
         topo = get_topology(topology); self.topology = topo.name
-        kwargs.update(nidx=topo.nidx, n_ibp_ops=topo.n_templates)
+        kwargs.update(nidx=topo.nidx)
 
         self.expr_enc = TransformerExpressionEncoderWithTarget(
             embed_dim, prime=prime, n_heads=n_heads, n_layers=n_expr_layers, **kwargs,
@@ -425,7 +425,7 @@ class IBPActionClassifier(nn.Module):
             embed_dim, n_heads=n_heads, n_layers=n_subs_layers, prime=prime, **kwargs,
         )
         self.sector_enc = SectorEncoder(embed_dim, topo.np)
-        self.action_enc = ActionEncoder(embed_dim, **kwargs)
+        self.action_enc = ActionEncoder(embed_dim, n_ibp_ops=topo.n_templates, **kwargs)
 
         # State combine: cls + target + subs + sector -> embed_dim
         self.state_combine = nn.Sequential(

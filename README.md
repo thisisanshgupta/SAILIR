@@ -27,7 +27,7 @@ results/                     Benchmark CSVs and training log
 
 - Python 3.10+
 - PyTorch, NumPy, Matplotlib
-- HTCondor (for §1 data-gen and §4 benchmark)
+- HTCondor (only for the original distributed triangle-box workflows; box1l uses local multiprocessing)
 - Kira + Fermat (for §6 only)
 
 ```bash
@@ -59,8 +59,31 @@ python scripts/eval/replay_reduction_path.py --path reduction.pkl --prime 1009
 
 The commands below retain the published triangle-box setup. For box1l, use
 `--topology box1l` consistently for generation, packing, training, and
-evaluation; its local data-generation and Colab workflow are described in the
-box1l training notes once the local multiprocessing generator is available.
+evaluation. The local generator is suitable for Colab and does not require
+HTCondor:
+
+```bash
+python scripts/data_gen/run_local_datagen.py \
+    --topology box1l --n_workers 4 --n_scrambles_per_worker 7500 \
+    --seed 42 --prime 1009 --output data/box1l_training_data.jsonl
+
+python scripts/data_gen/preprocess_to_tensors.py \
+    --topology box1l --input data/box1l_training_data.jsonl \
+    --output_dir data/box1l_tensors --seed 42
+
+python scripts/train/train_classifier.py \
+    --topology box1l --data_dir data/box1l_tensors \
+    --output_dir checkpoints/box1l --prime 1009 --epochs 30 \
+    --batch_size 256 --lr 4e-4 --device auto --resume auto
+
+python scripts/eval/onestep_worker.py \
+    --integral 1,-1,1,0 --topology box1l --box-masters-only \
+    --model-checkpoint checkpoints/box1l/best_model.pt \
+    --output reduction_box1l.pkl --beam_width 20 --prime 1009
+```
+
+The full Drive-backed Colab workflow, including tests, plots and hierarchical
+Laporta comparisons, is in [notebooks/box1l_colab.ipynb](notebooks/box1l_colab.ipynb).
 
 ### 1. Generate training data
 

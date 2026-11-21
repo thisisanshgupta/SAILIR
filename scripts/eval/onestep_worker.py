@@ -40,7 +40,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'sailir'))
 
 import torch
-from ibp_env import IBPEnvironment, set_prime, set_paper_masters_only, set_topology, is_master, weight
+from ibp_env import IBPEnvironment, set_prime, set_paper_masters_only, set_topology, is_master, is_zero, weight
 from beam_search import beam_search
 from beam_search_utils import get_sector_mask, max_weight
 from classifier import IBPActionClassifier
@@ -117,6 +117,9 @@ def main():
     # Parse integral (strip quotes that may be passed from Condor)
     integral_str = args.integral.strip("'\"")
     integral = tuple(int(x) for x in integral_str.split(','))
+    if len(integral) != env.topology.nidx:
+        raise ValueError(f'{args.topology} integrals require {env.topology.nidx} indices')
+    if is_zero(integral): raise ValueError(f'Integral {integral} vanishes for topology {args.topology}')
     target_sector = tuple(get_sector_mask(integral))
 
     if args.verbose:
@@ -169,7 +172,8 @@ def main():
             patience=None,
             stop_on_weight_improvement=True,
             random_target=args.random_target,
-            beam_sort=args.beam_sort
+            beam_sort=args.beam_sort,
+            topology=args.topology
         )
 
         if solution:
@@ -258,6 +262,7 @@ def main():
         'steps': steps,
         'time': elapsed,
         'prime': args.prime,
+        'topology': args.topology,
         'peak_memory_kb': peak_rss_kb
     }
 

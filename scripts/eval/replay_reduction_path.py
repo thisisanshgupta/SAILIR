@@ -22,7 +22,7 @@ from collections import defaultdict
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'sailir'))
 
 # Import EXACTLY what v13 imports - DO NOT REIMPLEMENT
-from ibp_env import IBPEnvironment, set_prime, set_kinematics, is_master, weight, PRIME
+from ibp_env import IBPEnvironment, set_prime, set_kinematics, set_topology, is_master, weight, PRIME
 
 # Import from same modules as v13
 from beam_search_utils import (
@@ -207,6 +207,7 @@ def main():
                         help='Additional patch paths to apply after main path (single-pickle mode)')
     parser.add_argument('--prime', type=int, default=10007,
                         help='Prime for modular arithmetic (different from original)')
+    parser.add_argument('--topology', choices=['trianglebox','box1l'], default=None)
     parser.add_argument('--d', type=int, default=41,
                         help='Spacetime dimension for kinematics')
     parser.add_argument('--m1', type=int, default=1,
@@ -252,8 +253,10 @@ def main():
         print("WARNING: Replay prime is same as original - this just verifies the path is consistent")
 
     # Set new prime and kinematics
+    chosen_topology = args.topology or data.get('topology', 'trianglebox')
+    set_topology(chosen_topology)
     set_prime(args.prime)
-    set_kinematics(d=args.d, m1=args.m1, m2=args.m2, m3=args.m3)
+    if chosen_topology == 'trianglebox': set_kinematics(d=args.d, m1=args.m1, m2=args.m2, m3=args.m3)
     print(f"Using PRIME = {args.prime}")
     print(f"Using kinematics: d={args.d}, m1={args.m1}, m2={args.m2}, m3={args.m3}")
 

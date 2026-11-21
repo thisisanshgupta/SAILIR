@@ -13,15 +13,18 @@ Smaller primes like 1009 make coefficients more learnable.
 """
 
 import ast
+import re
 import torch
 from pathlib import Path
 from topology import get_topology, vanishes
 
 TOPOLOGY = get_topology()
+GOAL_STATES = TOPOLOGY.goal_states()
 def set_topology(topology):
-    global TOPOLOGY, KINEMATICS
+    global TOPOLOGY, KINEMATICS, GOAL_STATES
     TOPOLOGY = get_topology(topology)
     KINEMATICS = dict(TOPOLOGY.kinematics)
+    GOAL_STATES = TOPOLOGY.goal_states()
 
 # Default prime - can be changed with set_prime()
 PRIME = 2147483647
@@ -118,7 +121,7 @@ def eval_coeff(coeff_str, seed):
     scope = {f'a{i}': int(x) for i,x in enumerate(seed)}
     scope.update({k:int(v) for k,v in KINEMATICS.items()})
     tree = ast.parse(coeff_str.replace('^', '**'), mode='eval')
-    allowed=(ast.Expression,ast.BinOp,ast.UnaryOp,ast.Add,ast.Sub,ast.Mult,ast.Div,ast.Pow,ast.USub,ast.UAdd,ast.Constant,ast.Name,ast.Mod)
+    allowed=(ast.Expression,ast.BinOp,ast.UnaryOp,ast.Add,ast.Sub,ast.Mult,ast.Div,ast.Pow,ast.USub,ast.UAdd,ast.Constant,ast.Name,ast.Mod,ast.Load)
     if any(not isinstance(n, allowed) for n in ast.walk(tree)): raise ValueError("Unsafe coefficient expression")
     return int(eval(compile(tree, '<ibp coefficient>', 'eval'), {'__builtins__':{}}, scope)) % PRIME
 
@@ -137,7 +140,7 @@ def get_raw_equation(ibp_t, li_t, ibp_op, seed):
         if c != 0:
             integral = tuple(seed[i] + shift[i] for i in range(TOPOLOGY.nidx))
             if not vanishes(TOPOLOGY, integral): eq[integral] = (eq.get(integral, 0) + c) % PRIME
-    return eq
+    return {integral: coeff for integral, coeff in eq.items() if coeff % PRIME}
 
 
 def apply_substitution(expr, sub_int, sol):
@@ -290,35 +293,20 @@ def solve_ibp_for(ibp, target):
 
 
 def is_top_sector(i):
-    if TOPOLOGY.name == 'box1l': return True
-    return i[0] >= 1 and i[2] >= 1 and i[4] >= 1 and i[5] >= 1
+    if TOPOLOGY.top_sector is None: return True
+    return all(not required or i[j] >= 1 for j, required in enumerate(TOPOLOGY.top_sector))
 
 
 # The 16 master integrals from paper 2502.05121v1.pdf (equation 2.5)
-PAPER_MASTERS = frozenset([
-    (0, 1, 1, 1, 0, 0, 0),
-    (1, 0, 1, 0, 1, 0, 0),
-    (1, 1, 0, 1, 1, 0, 0),
-    (0, 0, 1, 1, 1, 0, 0),
-    (1, 0, 1, 1, 1, 0, 0),
-    (1, -1, 1, 1, 1, 0, 0),
-    (0, 1, 1, 1, 1, 0, 0),
-    (-1, 1, 1, 1, 1, 0, 0),
-    (1, 1, 1, 1, 1, 0, 0),
-    (1, 0, 1, 0, 0, 1, 0),
-    (1, 1, 0, 1, 0, 1, 0),
-    (1, 0, 1, 0, 1, 1, 0),
-    (1, -1, 1, 0, 1, 1, 0),
-    (1, 0, 0, 1, 1, 1, 0),
-    (1, 1, 0, 1, 1, 1, 0),
-    (1, 0, 1, 1, 1, 1, 0),
-])
-
+PAPER_MASTERS = TOPOLOGY.masters
 
 def get_sector(integral):
-    """Get the sector mask for an integral (first 6 indices)."""
+    """Return the configured propagator-sector mask for an integral."""
     return tuple(1 if integral[j] > 0 else 0 for j in range(TOPOLOGY.np))
 
+def is_zero(integral):
+    """Return whether an integral vanishes by topology-specific scalelessness."""
+    return vanishes(TOPOLOGY, integral)
 
 # Sectors covered by the paper masters
 PAPER_MASTER_SECTORS = frozenset(get_sector(m) for m in PAPER_MASTERS)
@@ -338,9 +326,7 @@ def set_paper_masters_only(value):
 def is_corner_integral(integral):
     """Check if integral is a corner integral.
 
-    A corner integral has:
-    - All positive indices in positions 0-5 equal to exactly 1
-    - No numerator power (position 6 = 0)
+    Propagator indices are zero or one and every ISP index is zero.
     """
     for j in range(TOPOLOGY.np):
         if integral[j] > 1:
@@ -355,18 +341,19 @@ def is_corner_integral(integral):
 def is_master(i):
     """Check if integral is a master integral.
 
-    Masters are:
-    1. The 16 specific integrals from paper 2502.05121v1.pdf (eq. 2.5)
-    2. Corner integrals in sectors NOT covered by the 16 paper masters
-       (unless PAPER_MASTERS_ONLY is True)
+    Masters come from the selected topology, with triangle-box corner fallbacks
+    in sectors not covered by its published master set.
     """
-    # Check if it's one of the 16 paper masters
-    if i in PAPER_MASTERS:
+    # Check the configured topology's true master set.
+    if i in TOPOLOGY.masters:
         return True
 
     # If paper-masters-only mode, don't accept corner integrals
     if PAPER_MASTERS_ONLY:
         return False
+
+    if TOPOLOGY.name == 'box1l':
+        return i in GOAL_STATES
 
     # Check if it's a corner integral in an uncovered sector
     sector = get_sector(i)
@@ -379,11 +366,8 @@ def is_master(i):
 def is_higher_sector(i):
     if TOPOLOGY.name == 'box1l':
         return False
-    # TODO: This is hardcoded for sector 53 (top sector = positions 0,2,4,5).
-    # It checks if integral is in top sector AND has extra propagators at 1, 3, or 6.
-    # If used for other sectors, this logic would need to be generalized.
-    # Currently only used by filter_mode='higher_only' which is deprecated.
-    top_positions = {0, 2, 4, 5} if TOPOLOGY.name == 'trianglebox' else set(range(TOPOLOGY.np))
+    # Detect additional active propagators outside the configured top-sector mask.
+    top_positions = {j for j, required in enumerate(TOPOLOGY.top_sector or ()) if required}
     return is_top_sector(i) and (any(i[j] >= 1 for j in range(TOPOLOGY.np) if j not in top_positions)
                                  or any(x >= 1 for x in i[TOPOLOGY.np:]))
 
@@ -393,7 +377,7 @@ def weight(i):
 
 
 def filter_top_sector(expr):
-    """Filter to top sector (positions 0,2,4,5 >= 1). Includes higher sectors."""
+    """Filter using the configured topology's top-sector rule."""
     return {k: v for k, v in expr.items() if is_top_sector(k)}
 
 
@@ -542,13 +526,12 @@ def filter_resolved_subs_to_exact_sector(resolved_subs, target_sector):
 
 
 def action_introduces_higher_sector(cached_eq, target):
-    """DEPRECATED: OLD filtering hardcoded for sector 53.
+    """Deprecated global top-sector filter.
 
     Only blocks integrals in 'higher sector' (top sector + extra propagators).
     This allows lateral sectors (same level, different propagators).
-    Only blocks integrals that are in top sector AND have propagators at positions 1, 3, or 6.
+    The configured top-sector mask is used by ``is_higher_sector``.
 
-    TODO: This function uses is_higher_sector() which is hardcoded for sector 53.
     Use action_introduces_outside_sector() with filter_mode='subsector' instead.
     """
     for integral in cached_eq.keys():
@@ -1174,8 +1157,18 @@ class IBPEnvironment:
     """Environment for IBP reduction with model-based action selection."""
 
     def __init__(self, ibp_path=None, li_path=None):
+        self.topology = TOPOLOGY
         self.ibp_t = build_box_templates() if TOPOLOGY.name == 'box1l' else parse_templates(ibp_path or IBP_PATH)
         self.li_t = {} if TOPOLOGY.name == 'box1l' else parse_templates(li_path or LI_PATH)
+
+        if TOPOLOGY.name == 'box1l':
+            probes = [(1, 0, 1, 0), (0, 1, 0, 1), (1, 1, 1, 1),
+                      (1, -1, 1, 0), (0, 0, 0, 0)]
+            for op, terms in self.ibp_t.items():
+                pivot_expr = terms[0][1]
+                for seed in probes:
+                    if eval_coeff(pivot_expr, seed) % PRIME == 0:
+                        raise AssertionError(f'Box IBP pivot coefficient vanishes mod {PRIME}: op={op}, seed={seed}')
 
         # Build shifts lookup
         self.shifts = {}
@@ -1410,7 +1403,7 @@ class IBPEnvironment:
         expr_coeffs = torch.zeros(1, max_terms, dtype=torch.long)
         expr_mask = torch.zeros(1, max_terms, dtype=torch.bool)
 
-        top_expr = filter_top_sector(expr)
+        top_expr = filter_top_sector({i: c for i, c in expr.items() if not is_zero(i)})
         for j, (integral, coeff) in enumerate(list(top_expr.items())[:max_terms]):
             expr_integrals[0, j] = torch.tensor(integral)
             expr_coeffs[0, j] = coeff

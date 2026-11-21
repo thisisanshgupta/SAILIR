@@ -20,7 +20,7 @@ from pathlib import Path
 import torch
 
 
-def load_and_convert(input_path, max_samples=None, nidx=7):
+def load_and_convert(input_path, max_samples=None, nidx=7, topology='trianglebox'):
     """Load JSONL and convert to lists of tensors. KEEPS ALL FIELDS."""
     samples = []
 
@@ -29,6 +29,9 @@ def load_and_convert(input_path, max_samples=None, nidx=7):
             if max_samples and i >= max_samples:
                 break
             s = json.loads(line)
+            record_topology = s.get('topology', 'trianglebox')
+            if record_topology != topology:
+                raise ValueError(f"Record {i} topology {record_topology!r} does not match requested {topology!r}")
 
             expr = s['expr']
             subs = s['subs']
@@ -73,7 +76,7 @@ def load_and_convert(input_path, max_samples=None, nidx=7):
     return samples
 
 
-def pack_samples(samples, nidx=7):
+def pack_samples(samples, nidx=7, topology='trianglebox'):
     """Pack variable-length samples into flat arrays with offsets. KEEPS ALL FIELDS."""
 
     # Collect all data
@@ -135,6 +138,7 @@ def pack_samples(samples, nidx=7):
         all_labels.append(s['label'])
 
     return {
+        'topology': topology,
         # === METADATA ===
         'scramble_ids': torch.tensor(all_scramble_ids, dtype=torch.int32),
         'sector_ids': torch.tensor(all_sector_ids, dtype=torch.int16),
@@ -178,7 +182,7 @@ def preprocess(input_path, output_dir, val_split=0.1, test_split=0.1, seed=42, t
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'sailir'))
     from topology import get_topology
-    samples = load_and_convert(input_path, nidx=get_topology(topology).nidx)
+    samples = load_and_convert(input_path, nidx=get_topology(topology).nidx, topology=topology)
     n_total = len(samples)
     print(f"Total samples: {n_total}", flush=True)
 
@@ -200,7 +204,7 @@ def preprocess(input_path, output_dir, val_split=0.1, test_split=0.1, seed=42, t
     # Pack and save each split
     print("Packing and saving splits...", flush=True)
     for name, split_samples in splits.items():
-        packed = pack_samples(split_samples, get_topology(topology).nidx)
+        packed = pack_samples(split_samples, get_topology(topology).nidx, topology)
         path = output_dir / f'{name}.pt'
         torch.save(packed, path)
         size_mb = path.stat().st_size / 1e6

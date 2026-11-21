@@ -56,6 +56,10 @@ class PackedDatasetV5(Dataset):
 
 MAX_REPLACEMENT_TERMS = 20  # Max replacement terms per substitution
 
+class TopologyCollator:
+    def __init__(self, nidx, np): self.nidx, self.np = nidx, np
+    def __call__(self, samples): return collate_fn(samples, self.nidx, self.np)
+
 def collate_fn(samples, nidx=7, np=6):
     """Pad variable-length tensors to batch max and stack."""
     batch_size = len(samples)
@@ -209,10 +213,13 @@ def main():
     parser.add_argument('--n_subs_layers', type=int, default=2)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--prime', type=int, default=1009)
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--device', type=str, default='auto')
+    parser.add_argument('--resume', type=str, default='auto', help='Checkpoint path, or auto to resume latest checkpoint if present')
     args = parser.parse_args()
     topology = get_topology(args.topology)
+    if args.device == 'auto': args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if args.device.startswith('cuda') and not torch.cuda.is_available():
+        print('CUDA requested but unavailable; using CPU', flush=True); args.device = 'cpu'
 
     print("=" * 70, flush=True)
     print("IBP Action Classifier v5 Training", flush=True)
@@ -235,6 +242,9 @@ def main():
     # Check that new fields exist
     assert 'target_integrals' in train_data, "Missing target_integrals! Did you repack with preprocess_to_tensors.py?"
     assert 'subs_raw' in train_data, "Missing subs_raw! Did you repack with preprocess_to_tensors.py?"
+    for split_name, split in [('train', train_data), ('val', val_data)]:
+        if split.get('topology', 'trianglebox') != args.topology:
+            raise ValueError(f"{split_name} tensor topology {split.get('topology')} does not match requested {args.topology}")
     print(f"  target_integrals shape: {train_data['target_integrals'].shape}", flush=True)
     print(f"  subs_raw count: {len(train_data['subs_raw'])}", flush=True)
 
@@ -243,15 +253,17 @@ def main():
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}", flush=True)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                              collate_fn=lambda batch: collate_fn(batch, topology.nidx, topology.np), num_workers=args.num_workers, pin_memory=True)
+                              collate_fn=TopologyCollator(topology.nidx, topology.np), num_workers=args.num_workers, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
-                            collate_fn=lambda batch: collate_fn(batch, topology.nidx, topology.np), num_workers=args.num_workers, pin_memory=True)
+                            collate_fn=TopologyCollator(topology.nidx, topology.np), num_workers=args.num_workers, pin_memory=True)
 
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}", flush=True)
 
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-    from ibp_env import set_prime
+    from ibp_env import set_prime, set_topology, IBPEnvironment
     set_prime(args.prime)
+    set_topology(args.topology)
+    IBPEnvironment()  # validates box pivot coefficients under the selected prime
 
     model = IBPActionClassifier(
         embed_dim=args.embed_dim, n_heads=args.n_heads,
@@ -278,14 +290,23 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr/10)
 
     start_epoch, best_val_loss = 1, float('inf')
-    if args.resume:
-        ckpt = torch.load(args.resume, weights_only=False)
+    resume_path = args.resume
+    if resume_path == 'auto':
+        candidates = sorted(output_dir.glob('checkpoint_epoch*.pt'), key=lambda p: int(p.stem.split('epoch')[-1]))
+        resume_path = str(candidates[-1]) if candidates else None
+    if resume_path:
+        ckpt = torch.load(resume_path, map_location=args.device, weights_only=False)
         if ckpt.get('topology', ckpt.get('args', {}).get('topology', 'trianglebox')) != args.topology: raise ValueError('Checkpoint topology mismatch')
         base_model.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if 'scheduler_state_dict' in ckpt: scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         start_epoch = ckpt['epoch'] + 1
-        best_val_loss = ckpt['val_metrics']['loss']
+        best_val_loss = ckpt.get('best_val_loss', ckpt['val_metrics']['loss'])
         print(f"Resumed from epoch {start_epoch-1}, best_val_loss={best_val_loss:.4f}", flush=True)
+
+    if start_epoch > args.epochs:
+        print(f'Training already reached requested epoch {args.epochs}; keeping existing checkpoints.', flush=True)
+        return
 
     print("\nStarting training...", flush=True)
     print("=" * 70, flush=True)
@@ -303,17 +324,18 @@ def main():
         if val_m['loss'] < best_val_loss:
             best_val_loss = val_m['loss']
             torch.save({'epoch': epoch, 'model_state_dict': base_model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(), 'val_metrics': val_m,
+                        'optimizer_state_dict': optimizer.state_dict(), 'scheduler_state_dict': scheduler.state_dict(), 'val_metrics': val_m,
                         'args': vars(args), 'topology': args.topology, 'topology_config': {'np': topology.np, 'n_isp': topology.n_isp, 'nidx': topology.nidx, 'n_templates': topology.n_templates, 'masters': [list(x) for x in topology.masters]}}, output_dir / 'best_model.pt')
             print(f"  -> New best val loss! Saved.", flush=True)
 
-        if epoch % 5 == 0:
-            torch.save({'epoch': epoch, 'model_state_dict': base_model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(), 'val_metrics': val_m,
-                        'args': vars(args), 'topology': args.topology, 'topology_config': {'np': topology.np, 'n_isp': topology.n_isp, 'nidx': topology.nidx, 'n_templates': topology.n_templates, 'masters': [list(x) for x in topology.masters]}}, output_dir / f'checkpoint_epoch{epoch}.pt')
+        checkpoint = {'epoch': epoch, 'model_state_dict': base_model.state_dict(),
+                      'optimizer_state_dict': optimizer.state_dict(), 'scheduler_state_dict': scheduler.state_dict(), 'val_metrics': val_m,
+                      'best_val_loss': best_val_loss, 'args': vars(args), 'topology': args.topology, 'topology_config': {'np': topology.np, 'n_isp': topology.n_isp, 'nidx': topology.nidx, 'n_templates': topology.n_templates, 'masters': [list(x) for x in topology.masters]}}
+        torch.save(checkpoint, output_dir / f'checkpoint_epoch{epoch}.pt')
+        torch.save(checkpoint, output_dir / 'latest_checkpoint.pt')
 
     torch.save({'epoch': args.epochs, 'model_state_dict': base_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(), 'val_metrics': val_m,
+                'optimizer_state_dict': optimizer.state_dict(), 'scheduler_state_dict': scheduler.state_dict(), 'val_metrics': val_m,
                 'args': vars(args), 'topology': args.topology, 'topology_config': {'np': topology.np, 'n_isp': topology.n_isp, 'nidx': topology.nidx, 'n_templates': topology.n_templates, 'masters': [list(x) for x in topology.masters]}}, output_dir / 'final_model.pt')
 
     print(f"\nTraining complete! Best val loss: {best_val_loss:.4f}", flush=True)

@@ -32,8 +32,9 @@ from collections import defaultdict
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'sailir'))
 
-from ibp_env import IBPEnvironment, set_prime, set_paper_masters_only, is_master, weight, PRIME
+from ibp_env import IBPEnvironment, set_prime, set_paper_masters_only, set_topology, is_master, weight, PRIME
 from beam_search_utils import get_sector_mask
+from topology import get_topology
 
 REPO_DIR = Path(__file__).parent.parent.parent.resolve()
 PYTHON_PATH = os.environ.get("SAILIR_PYTHON", sys.executable)  # override with SAILIR_PYTHON env var if Condor workers need a different interpreter
@@ -42,6 +43,56 @@ PYTHON_PATH = os.environ.get("SAILIR_PYTHON", sys.executable)  # override with S
 def integral_to_str(integral):
     """Convert integral tuple to string for filenames."""
     return '_'.join(str(x) for x in integral)
+
+def shared_env_topology_nidx(name):
+    return get_topology(name).nidx
+
+def run_local_reduction(args, starting_integral, work_dir):
+    """Colab-friendly synchronous hierarchy using the same one-step worker."""
+    expr = {starting_integral: 1}
+    total_steps = 0
+    path = []
+    jobs = 0
+    result_dir = work_dir / 'results'; result_dir.mkdir(parents=True, exist_ok=True)
+    start_time = time.time()
+    limit = max(100, args.max_steps if args.max_steps < 100000 else 10000)
+    print(f'Local reduction: up to {limit} one-step jobs; topology={args.topology}', flush=True)
+    for iteration in range(limit):
+        expr = {k: v % args.prime for k, v in expr.items() if v % args.prime}
+        nonmasters = [i for i, c in expr.items() if c and not is_master(i)]
+        if not nonmasters:
+            break
+        target = max(nonmasters, key=lambda i: (weight(i)[0], weight(i)[1], tuple(-x for x in weight(i)[2])))
+        worker_out = result_dir / f'local_{iteration:05d}_{integral_to_str(target)}.pkl'
+        cmd = [sys.executable, '-u', str(REPO_DIR / 'scripts/eval/onestep_worker.py'),
+               '--integral', ','.join(map(str, target)), '--output', str(worker_out),
+               '--model-checkpoint', args.model_checkpoint, '--beam_width', str(args.beam_width),
+               '--max_steps', str(args.max_steps), '--prime', str(args.prime), '--device', 'cpu',
+               '--topology', args.topology]
+        if args.box_masters_only: cmd.append('--box-masters-only')
+        elif args.paper_masters_only: cmd.append('--paper-masters-only')
+        cmd.extend(['--beam-sort', args.beam_sort])
+        print(f'  [{iteration+1}] reduce {target}', flush=True)
+        subprocess.run(cmd, cwd=REPO_DIR, check=True)
+        jobs += 1
+        with worker_out.open('rb') as f: worker = pickle.load(f)
+        if not worker.get('success'):
+            print(f'  Worker could not improve {target}; stopping.', flush=True)
+            break
+        input_coefficient = expr.pop(target)
+        for term, coefficient in worker['final_expr'].items():
+            expr[term] = (expr.get(term, 0) + input_coefficient * coefficient) % args.prime
+        expr = {k: v for k, v in expr.items() if v}
+        total_steps += worker.get('steps', 0)
+        path.extend(worker.get('path', []))
+    success = all(is_master(i) for i, c in expr.items() if c)
+    result = {'success': success, 'start_integral': starting_integral, 'expr': expr,
+              'final_expr': expr, 'path': path, 'steps': total_steps,
+              'time': time.time()-start_time, 'prime': args.prime,
+              'topology': args.topology, 'total_jobs': jobs}
+    output = Path(args.output); output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open('wb') as f: pickle.dump(result, f)
+    print(f'Local hierarchy finished: success={success}, expression={expr}, elapsed={result["time"]:.1f}s', flush=True)
 
 
 def apply_substitutions(expr, cache, prime):
@@ -85,20 +136,22 @@ def get_non_masters(expr):
 
 def create_condor_submit(work_dir, integral, job_name, output_file,
                          model_checkpoint, beam_width, max_steps, prime,
-                         paper_masters_only=False, cpus=1, beam_sort='weight'):
+                         paper_masters_only=False, cpus=1, beam_sort='weight', topology='trianglebox', box_masters_only=False):
     """Create a Condor submit file for a single-integral one-step reduction."""
 
     integral_str = ','.join(str(x) for x in integral)
     paper_masters_flag = ' --paper-masters-only' if paper_masters_only else ''
     n_workers_flag = f' --n_workers {cpus}' if cpus > 1 else ''
     beam_sort_flag = f' --beam-sort {beam_sort}' if beam_sort != 'weight' else ''
+    topology_flag = f' --topology {topology}'
+    box_flag = ' --box-masters-only' if box_masters_only else ''
     memory = 4 * cpus  # Scale memory with CPUs
 
     # Use v13 one-step worker - reduces by one weight level then returns
     # The async loop will cache and resubmit as needed
     submit_content = f"""universe = vanilla
 executable = {PYTHON_PATH}
-arguments = -u {REPO_DIR}/scripts/eval/onestep_worker.py --integral='{integral_str}' --output {output_file} --model-checkpoint {model_checkpoint} --beam_width {beam_width} --max_steps {max_steps} --prime {prime} --device cpu -v{paper_masters_flag}{n_workers_flag}{beam_sort_flag}
+arguments = -u {REPO_DIR}/scripts/eval/onestep_worker.py --integral='{integral_str}' --output {output_file} --model-checkpoint {model_checkpoint} --beam_width {beam_width} --max_steps {max_steps} --prime {prime} --device cpu -v{paper_masters_flag}{n_workers_flag}{beam_sort_flag}{topology_flag}{box_flag}
 output = {work_dir}/logs/{job_name}.out
 error = {work_dir}/logs/{job_name}.err
 log = {work_dir}/logs/{job_name}.log
@@ -177,6 +230,9 @@ def main():
                         help='Maximum concurrent Condor jobs')
     parser.add_argument('--paper-masters-only', action='store_true',
                         help='Reduce to paper masters only (no corner integrals)')
+    parser.add_argument('--topology', choices=['trianglebox','box1l'], default='trianglebox')
+    parser.add_argument('--box-masters-only', action='store_true')
+    parser.add_argument('--local', action='store_true', help='Run one-step workers locally instead of submitting HTCondor jobs')
     parser.add_argument('--straggler-timeout', type=int, default=1800,
                         help='Seconds before a job is considered a straggler (default 30 min)')
     parser.add_argument('--straggler-cpus', type=int, default=8,
@@ -203,16 +259,26 @@ def main():
     (work_dir / 'results').mkdir(exist_ok=True)
 
     set_prime(args.prime)
+    set_topology(args.topology)
     if args.paper_masters_only:
+        set_paper_masters_only(True)
+    if args.box_masters_only:
+        if args.topology != 'box1l': raise ValueError('--box-masters-only requires --topology box1l')
         set_paper_masters_only(True)
 
     env = IBPEnvironment()
 
     # Parse starting integral
     starting_integral = tuple(int(x) for x in args.integral.split(','))
+    if len(starting_integral) != shared_env_topology_nidx(args.topology):
+        raise ValueError(f'{args.topology} integrals require {shared_env_topology_nidx(args.topology)} indices')
     print(f'Starting integral: I{list(starting_integral)}')
     print(f'Starting weight: {weight(starting_integral)}')
     print()
+
+    if args.local:
+        run_local_reduction(args, starting_integral, work_dir)
+        return
 
     # State
     expr = {starting_integral: 1}  # Current expression (linear combo of integrals)
@@ -267,7 +333,8 @@ def main():
             submit_file = create_condor_submit(
                 work_dir, integral, job_name, output_file,
                 args.model_checkpoint, args.beam_width, args.max_steps, args.prime,
-                args.paper_masters_only, cpus=1, beam_sort=args.beam_sort
+                args.paper_masters_only, cpus=1, beam_sort=args.beam_sort,
+                topology=args.topology, box_masters_only=args.box_masters_only
             )
 
             if args.dry_run:
@@ -334,7 +401,8 @@ def main():
                 submit_file = create_condor_submit(
                     work_dir, integral, job_name, new_output_file,
                     args.model_checkpoint, args.beam_width, args.max_steps, args.prime,
-                    args.paper_masters_only, cpus=args.straggler_cpus, beam_sort=args.beam_sort
+                    args.paper_masters_only, cpus=args.straggler_cpus, beam_sort=args.beam_sort,
+                    topology=args.topology, box_masters_only=args.box_masters_only
                 )
 
                 new_cluster_id = submit_condor_job(submit_file)
@@ -481,6 +549,8 @@ def main():
         # by the orchestrator-mode replay.
         'start_integral': starting_integral,
         'prime': args.prime,
+        'topology': args.topology,
+        'success': not bool(non_masters),
         'final_expr': expr,
         'cache': cache,
         'total_jobs': total_jobs,

@@ -22,41 +22,24 @@ import random
 import json
 import argparse
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sailir"))
+import ibp_env as shared_env
+from topology import get_topology, vanishes
+TOPOLOGY = get_topology()
 
 # Global prime - set by command line argument
 PRIME = None
 
-# =============================================================================
-# 16 Master Integrals from arXiv:2502.05121 (equation 2.5)
-# =============================================================================
-PAPER_MASTERS = {
-    14: [(0, 1, 1, 1, 0, 0, 0)],                    # sector 14
-    21: [(1, 0, 1, 0, 1, 0, 0)],                    # sector 21
-    27: [(1, 1, 0, 1, 1, 0, 0)],                    # sector 27
-    28: [(0, 0, 1, 1, 1, 0, 0)],                    # sector 28
-    29: [(1, 0, 1, 1, 1, 0, 0), (1, -1, 1, 1, 1, 0, 0)],  # sector 29 (2 masters)
-    30: [(0, 1, 1, 1, 1, 0, 0), (-1, 1, 1, 1, 1, 0, 0)],  # sector 30 (2 masters)
-    31: [(1, 1, 1, 1, 1, 0, 0)],                    # sector 31
-    37: [(1, 0, 1, 0, 0, 1, 0)],                    # sector 37
-    43: [(1, 1, 0, 1, 0, 1, 0)],                    # sector 43
-    53: [(1, 0, 1, 0, 1, 1, 0), (1, -1, 1, 0, 1, 1, 0)],  # sector 53 (2 masters)
-    57: [(1, 0, 0, 1, 1, 1, 0)],                    # sector 57
-    59: [(1, 1, 0, 1, 1, 1, 0)],                    # sector 59
-    61: [(1, 0, 1, 1, 1, 1, 0)],                    # sector 61
-}
-
-# Sectors that have paper masters
-SECTORS_WITH_PAPER_MASTERS = set(PAPER_MASTERS.keys())
-
+# Sector goals are derived from the shared topology configuration.
 
 def get_sector_id(integral):
     """
     Compute sector ID from integral indices.
-    Sector ID = binary encoding of which propagators (indices 0-5) have power >= 1.
-    Index 6 is the ISP and doesn't contribute to sector ID.
+    Sector ID is the binary encoding of the configured propagator indices.
     """
     sector_id = 0
-    for i in range(6):  # Only first 6 indices (propagators)
+    for i in range(TOPOLOGY.np):  # Only first 6 indices (propagators)
         if integral[i] >= 1:
             sector_id += (1 << i)
     return sector_id
@@ -65,18 +48,18 @@ def get_sector_id(integral):
 def get_sector_mask(sector_id):
     """
     Get the sector mask (which propagators must be >= 1).
-    Returns tuple of 6 booleans.
+    Returns one boolean per configured propagator.
     """
-    return tuple((sector_id >> i) & 1 for i in range(6))
+    return tuple((sector_id >> i) & 1 for i in range(TOPOLOGY.np))
 
 
 def get_corner_integral(sector_id):
     """
     Get the corner integral for a sector.
-    Corner = (mask[0], mask[1], ..., mask[5], 0) where mask[i] = 1 if bit i is set.
+    Corner contains the sector mask followed by zero ISP indices.
     """
     mask = get_sector_mask(sector_id)
-    return tuple(mask) + (0,)
+    return tuple(mask) + (0,) * TOPOLOGY.n_isp
 
 
 def get_masters_for_sector(sector_id):
@@ -84,10 +67,10 @@ def get_masters_for_sector(sector_id):
     Get list of master integrals for a sector.
     Uses paper masters if available, otherwise corner integral.
     """
-    if sector_id in PAPER_MASTERS:
-        return [tuple(m) for m in PAPER_MASTERS[sector_id]]
-    else:
-        return [get_corner_integral(sector_id)]
+    sector = get_sector_mask(sector_id)
+    masters = [tuple(m) for m in TOPOLOGY.masters
+               if tuple(1 if m[i] > 0 else 0 for i in range(TOPOLOGY.np)) == sector]
+    return masters or [get_corner_integral(sector_id)]
 
 
 def is_in_sector(integral, sector_id):
@@ -97,7 +80,7 @@ def is_in_sector(integral, sector_id):
     - For each propagator i where S requires power >= 1, integral[i] >= 1
     """
     mask = get_sector_mask(sector_id)
-    for i in range(6):
+    for i in range(TOPOLOGY.np):
         if mask[i] and integral[i] < 1:
             return False
     return True
@@ -113,12 +96,12 @@ def is_higher_sector(integral, sector_id):
         return False
 
     mask = get_sector_mask(sector_id)
-    for i in range(6):
+    for i in range(TOPOLOGY.np):
         # If this propagator is NOT required by sector but integral has it >= 1
         if not mask[i] and integral[i] >= 1:
             return True
     # Also check ISP (index 6) - if ISP has power >= 1, it's a higher sector
-    if integral[6] >= 1:
+    if any(x >= 1 for x in integral[TOPOLOGY.np:]):
         return True
     return False
 
@@ -187,6 +170,7 @@ def apply_all_substitutions(expr, subs):
 # =============================================================================
 
 def parse_templates(path):
+    if TOPOLOGY.name == 'box1l': return shared_env.build_box_templates()
     templates = {}
     current_idx, terms = None, []
     with open(path, 'r') as f:
@@ -211,16 +195,12 @@ def parse_templates(path):
 
 
 def evaluate_coefficient(coeff_str, seed):
-    a0, a1, a2, a3, a4, a5, a6 = seed
-    d, m1, m2, m3 = 41, 1, 31, 47
-    try:
-        return eval(coeff_str.replace('^', '**')) % PRIME
-    except:
-        return 0
+    return shared_env.eval_coeff(coeff_str, seed)
 
 
 def get_raw_equation(ibp_t, li_t, ibp_op, seed):
-    if ibp_op >= 8:
+    if TOPOLOGY.name == 'box1l': template = ibp_t.get(ibp_op, [])
+    elif ibp_op >= 8:
         template = li_t.get(ibp_op - 8, [])
     else:
         template = ibp_t.get(ibp_op, [])
@@ -228,8 +208,9 @@ def get_raw_equation(ibp_t, li_t, ibp_op, seed):
     for shift, coeff_str in template:
         coeff = evaluate_coefficient(coeff_str, seed)
         if coeff:
-            eq[tuple(seed[i] + shift[i] for i in range(7))] = coeff
-    return eq
+            integral = tuple(seed[i] + shift[i] for i in range(TOPOLOGY.nidx))
+            if not vanishes(TOPOLOGY, integral): eq[integral] = (eq.get(integral, 0) + coeff) % PRIME
+    return {integral: coeff for integral, coeff in eq.items() if coeff % PRIME}
 
 
 # =============================================================================
@@ -246,7 +227,7 @@ def action_introduces_higher_sector(cached_eq, sector_id):
 
 def get_integral_props(integral):
     """Get the set of propagator indices where integral has power >= 1."""
-    return {i for i in range(6) if integral[i] >= 1}
+    return {i for i in range(TOPOLOGY.np) if integral[i] >= 1}
 
 
 def is_lateral_sector(integral, sector_id):
@@ -261,7 +242,7 @@ def is_lateral_sector(integral, sector_id):
              sector 55 has props {0,1,2,4,5} - NOT lateral (superset)
     """
     int_props = get_integral_props(integral)
-    target_props = {i for i in range(6) if (sector_id >> i) & 1}
+    target_props = {i for i in range(TOPOLOGY.np) if (sector_id >> i) & 1}
     is_subset = int_props <= target_props
     is_superset = int_props >= target_props
     return not is_subset and not is_superset
@@ -312,6 +293,12 @@ def scramble(start, ibp_t, li_t, num_ops, n_steps, sector_id, filter_lateral=Fal
 
         for ibp_op, seed in candidates:
             raw = get_raw_equation(ibp_t, li_t, ibp_op, seed)
+
+            # Box samples train one sector at a time. Keep the trajectory in
+            # that exact sector so dropping lower-sector terms cannot alter
+            # the corner coefficient being unscrambled.
+            if TOPOLOGY.name == 'box1l' and any(get_sector_id(k) != sector_id for k in raw):
+                continue
 
             # Check if this IBP introduces higher sector (and optionally lateral sectors)
             if filter_lateral:
@@ -368,7 +355,7 @@ def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, sector_id,
     # Direct actions: target directly in raw_ibp
     for ibp_op, shift_list in shifts.items():
         for shift in shift_list:
-            seed = tuple(target[i] - shift[i] for i in range(7))
+            seed = tuple(target[i] - shift[i] for i in range(TOPOLOGY.nidx))
             raw = get_raw_equation(ibp_t, li_t, ibp_op, seed)
             if target not in raw or raw[target] == 0:
                 continue
@@ -383,7 +370,7 @@ def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, sector_id,
                 else:
                     if action_introduces_higher_sector(cached, sector_id):
                         continue
-            delta = tuple(seed[i] - target[i] for i in range(7))
+            delta = tuple(seed[i] - target[i] for i in range(TOPOLOGY.nidx))
             if (ibp_op, delta) not in seen:
                 seen.add((ibp_op, delta))
                 valid.append((ibp_op, delta))
@@ -392,7 +379,7 @@ def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, sector_id,
     for sub_int in subs:
         for ibp_op, shift_list in shifts.items():
             for shift in shift_list:
-                seed = tuple(sub_int[i] - shift[i] for i in range(7))
+                seed = tuple(sub_int[i] - shift[i] for i in range(TOPOLOGY.nidx))
                 raw = get_raw_equation(ibp_t, li_t, ibp_op, seed)
                 if sub_int not in raw or raw[sub_int] == 0:
                     continue
@@ -409,7 +396,7 @@ def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, sector_id,
                     else:
                         if action_introduces_higher_sector(cached, sector_id):
                             continue
-                delta = tuple(seed[i] - target[i] for i in range(7))
+                delta = tuple(seed[i] - target[i] for i in range(TOPOLOGY.nidx))
                 if (ibp_op, delta) not in seen:
                     seen.add((ibp_op, delta))
                     valid.append((ibp_op, delta))
@@ -438,14 +425,16 @@ def get_all_valid_sectors():
     """
     Get list of all 63 non-trivial sectors (sector_id 1-63).
     """
-    return list(range(1, 64))
+    if TOPOLOGY.nonzero_sectors is not None: return list(TOPOLOGY.nonzero_sectors)
+    return list(range(1, 1 << TOPOLOGY.np))
 
 
 def main():
-    global PRIME
+    global PRIME, TOPOLOGY
 
     parser = argparse.ArgumentParser(
         description='Generate multi-sector IBP reduction training data')
+    parser.add_argument('--topology', choices=['trianglebox','box1l'], default='trianglebox')
     parser.add_argument('--n_scrambles', type=int, default=1000,
                         help='Number of scramble trajectories to generate')
     parser.add_argument('--min_steps', type=int, default=5,
@@ -457,6 +446,8 @@ def main():
                         help='Output file path')
     parser.add_argument('--start_seed', type=int, default=0,
                         help='Starting random seed')
+    parser.add_argument('--id_offset', type=int, default=0,
+                        help='Offset for globally unique scramble IDs when workers are merged')
     parser.add_argument('--prime', type=int, default=1009,
                         help='Prime for modular arithmetic')
     parser.add_argument('--ibp_path', type=str,
@@ -469,7 +460,12 @@ def main():
                         help='Also filter out actions that introduce lateral sector integrals')
     args = parser.parse_args()
 
+    TOPOLOGY = get_topology(args.topology)
+    shared_env.set_topology(args.topology)
+    shared_env.set_prime(args.prime)
     PRIME = args.prime
+    if args.topology == 'box1l':
+        shared_env.IBPEnvironment()  # startup check for sampled box pivot coefficients
 
     print(f"=" * 70, flush=True)
     print(f"Multi-Sector IBP Training Data Generator", flush=True)
@@ -482,17 +478,17 @@ def main():
 
     # Always use all 63 sectors
     sector_list = get_all_valid_sectors()
-    print(f"Using all {len(sector_list)} sectors (1-63)", flush=True)
+    print(f"Using {len(sector_list)} topology sectors", flush=True)
 
     # Load IBP/LI templates
     ibp_t = parse_templates(args.ibp_path)
-    li_t = parse_templates(args.li_path)
+    li_t = {} if args.topology == 'box1l' else parse_templates(args.li_path)
     num_ops = len(ibp_t) + len(li_t)
     print(f"Loaded {len(ibp_t)} IBP templates, {len(li_t)} LI templates", flush=True)
 
     # Build shifts lookup
     shifts = {}
-    for ibp_op in range(8):
+    for ibp_op in range(TOPOLOGY.n_templates if args.topology == "box1l" else 8):
         if ibp_op in ibp_t:
             shifts[ibp_op] = [s for s, _ in ibp_t[ibp_op]]
     for li_idx in li_t:
@@ -504,6 +500,7 @@ def main():
     successful_scrambles = 0
     failed_scrambles = 0
     skipped_vanishing = 0  # Sectors with vanishing corners
+    no_action_scrambles = 0
     sector_counts = {}  # Track samples per sector
 
     with open(args.output, 'w') as f:
@@ -529,11 +526,13 @@ def main():
                                            filter_lateral=args.filter_lateral)
 
             if not used_ibps:
-                # Check if this is a vanishing corner (expression became empty or trivial)
-                # This happens when the corner integral is zero by IBP identities
-                skipped_vanishing += 1
-                print(f"SKIPPED_VANISHING: scramble={scramble_idx}, sector={sector_id}, "
-                      f"masters={masters}, reason=no_valid_scramble_actions", flush=True)
+                if vanishes(TOPOLOGY, next(iter(start))):
+                    skipped_vanishing += 1
+                    reason = 'vanishing corner'
+                else:
+                    no_action_scrambles += 1
+                    reason = 'corner is already a goal or no sector-preserving scramble action exists'
+                print(f"SKIPPED: scramble={scramble_idx}, sector={sector_id}, masters={masters}, reason={reason}", flush=True)
                 continue
 
             # Unscramble and collect training samples
@@ -579,7 +578,7 @@ def main():
                     break
 
                 idx, chosen_ibp_op, chosen_seed = found_action
-                chosen_delta = tuple(chosen_seed[i] - target[i] for i in range(7))
+                chosen_delta = tuple(chosen_seed[i] - target[i] for i in range(TOPOLOGY.nidx))
 
                 # Enumerate valid actions
                 valid_actions = enumerate_valid_actions(
@@ -596,7 +595,8 @@ def main():
 
                 # Create training sample with sector_id
                 sample = {
-                    'scramble_id': scramble_idx,
+                    'scramble_id': args.id_offset + scramble_idx,
+                    'topology': args.topology,
                     'sector_id': sector_id,  # NEW: include sector for model conditioning
                     'sector_mask': list(get_sector_mask(sector_id)),  # NEW: 6-bit mask
                     'step': iteration,
@@ -631,7 +631,7 @@ def main():
                 sector_counts[sector_id] = sector_counts.get(sector_id, 0) + len(scramble_samples)
             else:
                 # Coefficient mismatch typically indicates vanishing corner
-                if failure_reason and failure_reason.startswith("coeff_mismatch"):
+                if TOPOLOGY.name != 'box1l' and failure_reason and failure_reason.startswith("coeff_mismatch"):
                     skipped_vanishing += 1
                     print(f"SKIPPED_VANISHING: scramble={scramble_idx}, sector={sector_id}, "
                           f"masters={masters}, reason={failure_reason}", flush=True)
@@ -648,6 +648,7 @@ def main():
     print(f"\n{'=' * 70}", flush=True)
     print(f"Done! {total_samples} training samples from {successful_scrambles} scrambles", flush=True)
     print(f"Skipped (vanishing corners): {skipped_vanishing}", flush=True)
+    print(f"Skipped (no scramble action): {no_action_scrambles}", flush=True)
     print(f"Failed scrambles: {failed_scrambles}", flush=True)
     print(f"Output: {args.output}", flush=True)
     print(f"\nSamples per sector:", flush=True)

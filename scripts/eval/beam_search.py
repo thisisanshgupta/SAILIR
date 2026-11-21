@@ -26,10 +26,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'sailir'))
 import numpy as np
 import torch
 from ibp_env import (
-    IBPEnvironment, set_prime, filter_top_sector, is_master, weight, resolve_subs,
+    IBPEnvironment, set_prime, set_topology, filter_top_sector, is_master, weight, resolve_subs,
     filter_subs_to_exact_sector, filter_resolved_subs_to_exact_sector
 )
 from classifier import IBPActionClassifier
+from topology import get_topology
 
 # Reuse core functions from v4
 from beam_search_utils import (
@@ -48,10 +49,11 @@ MAX_REPLACEMENT_TERMS = 20  # Must match training
 _worker_env = None
 
 
-def init_worker(prime):
+def init_worker(prime, topology="trianglebox"):
     """Initialize worker process with its own IBPEnvironment."""
     global _worker_env
     set_prime(prime)
+    set_topology(topology)
     _worker_env = IBPEnvironment()
 
 
@@ -120,7 +122,7 @@ def apply_actions_worker(args):
         n_non_masters = 0
         for integral in new_expr.keys():
             if target_sector is not None:
-                sector = tuple(1 if integral[i] > 0 else 0 for i in range(6))
+                sector = tuple(get_sector_mask(integral))
                 if sector != target_sector:
                     continue
             if not is_master(integral):
@@ -135,12 +137,13 @@ def apply_actions_worker(args):
     return results
 
 
-def prepare_batched_input_v5(batch_data, device):
+def prepare_batched_input_v5(batch_data, device, topology='trianglebox'):
     """
     Prepare batched model input for V5 model using numpy for speed.
     v11: No term limit, take LAST 50 subs (most recent/relevant).
     """
     batch_size = len(batch_data)
+    topo = get_topology(topology)
 
     # v11: Compute max_terms dynamically (no limit), keep max_subs=50 (model constraint)
     max_terms = max(len(filter_to_sector(d[0], d[3])) for d in batch_data) if batch_data else 1
@@ -150,22 +153,22 @@ def prepare_batched_input_v5(batch_data, device):
     max_actions = min(max_actions, 900)
 
     # Allocate numpy arrays
-    expr_integrals_np = np.zeros((batch_size, max_terms, 7), dtype=np.int64)
+    expr_integrals_np = np.zeros((batch_size, max_terms, topo.nidx), dtype=np.int64)
     expr_coeffs_np = np.zeros((batch_size, max_terms), dtype=np.int64)
     expr_mask_np = np.zeros((batch_size, max_terms), dtype=np.bool_)
 
-    sub_keys_np = np.zeros((batch_size, max_subs, 7), dtype=np.int64)
-    sub_repl_ints_np = np.zeros((batch_size, max_subs, MAX_REPLACEMENT_TERMS, 7), dtype=np.int64)
+    sub_keys_np = np.zeros((batch_size, max_subs, topo.nidx), dtype=np.int64)
+    sub_repl_ints_np = np.zeros((batch_size, max_subs, MAX_REPLACEMENT_TERMS, topo.nidx), dtype=np.int64)
     sub_repl_coeffs_np = np.zeros((batch_size, max_subs, MAX_REPLACEMENT_TERMS), dtype=np.int64)
     sub_repl_mask_np = np.zeros((batch_size, max_subs, MAX_REPLACEMENT_TERMS), dtype=np.bool_)
     sub_mask_np = np.zeros((batch_size, max_subs), dtype=np.bool_)
 
     action_ibp_ops_np = np.zeros((batch_size, max_actions), dtype=np.int64)
-    action_deltas_np = np.zeros((batch_size, max_actions, 7), dtype=np.int64)
+    action_deltas_np = np.zeros((batch_size, max_actions, topo.nidx), dtype=np.int64)
     action_mask_np = np.zeros((batch_size, max_actions), dtype=np.bool_)
 
-    sector_masks_np = np.zeros((batch_size, 6), dtype=np.int64)
-    target_integrals_np = np.zeros((batch_size, 7), dtype=np.int64)
+    sector_masks_np = np.zeros((batch_size, topo.np), dtype=np.int64)
+    target_integrals_np = np.zeros((batch_size, topo.nidx), dtype=np.int64)
 
     n_valid_actions = []
 
@@ -225,7 +228,7 @@ def prepare_batched_input_v5(batch_data, device):
 def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cpu', verbose=True,
                 target_sector=None, filter_mode='subsector', track_integrals=None,
                 use_resolved_subs=True, n_workers=16, prime=1009, patience=None,
-                stop_on_weight_improvement=False, random_target=False, beam_sort='weight'):
+                stop_on_weight_improvement=False, random_target=False, beam_sort='weight', topology='trianglebox'):
     """Beam search with state-level parallelization.
 
     Args:
@@ -339,7 +342,7 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
     # Initialize worker pool
     pool = None
     if n_workers > 1 and use_resolved_subs:
-        pool = mp.Pool(processes=n_workers, initializer=init_worker, initargs=(prime,))
+        pool = mp.Pool(processes=n_workers, initializer=init_worker, initargs=(prime, topology))
         print(f"  Initialized worker pool with {n_workers} workers", flush=True)
 
     try:
@@ -512,7 +515,7 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
 
             if len(batch_data) <= P2_SUB_BATCH:
                 # Small enough to do in one shot
-                batch, n_valid_actions = prepare_batched_input_v5(batch_data, device)
+                batch, n_valid_actions = prepare_batched_input_v5(batch_data, device, topology)
                 with torch.no_grad():
                     logits, probs = model(
                         batch['expr_integrals'], batch['expr_coeffs'], batch['expr_mask'],
@@ -530,7 +533,7 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                 n_valid_actions = []
                 for sb_start in range(0, len(batch_data), P2_SUB_BATCH):
                     sb_data = batch_data[sb_start:sb_start + P2_SUB_BATCH]
-                    sb_batch, sb_nva = prepare_batched_input_v5(sb_data, device)
+                    sb_batch, sb_nva = prepare_batched_input_v5(sb_data, device, topology)
                     with torch.no_grad():
                         sb_logits, sb_probs = model(
                             sb_batch['expr_integrals'], sb_batch['expr_coeffs'], sb_batch['expr_mask'],
@@ -739,6 +742,7 @@ def main():
                         help='Maximum number of reduction steps')
     parser.add_argument('--prime', type=int, default=1009,
                         help='Prime for modular arithmetic')
+    parser.add_argument('--topology', choices=['trianglebox','box1l'], default='trianglebox')
     parser.add_argument('--device', type=str, default='cpu',
                         help='Device to run model on')
     parser.add_argument('--filter_mode', type=str, default='higher_only',
@@ -761,6 +765,7 @@ def main():
 
     # Set prime
     set_prime(args.prime)
+    set_topology(args.topology)
     print(f'Using PRIME = {args.prime}', flush=True)
 
     # Load environment
@@ -772,6 +777,8 @@ def main():
     print(f'\nLoading model from {args.checkpoint}...', flush=True)
     checkpoint = torch.load(args.checkpoint, weights_only=False, map_location=args.device)
     ckpt_args = checkpoint.get('args', {})
+    checkpoint_topology = checkpoint.get('topology', ckpt_args.get('topology', 'trianglebox'))
+    if checkpoint_topology != args.topology: raise ValueError(f'Checkpoint topology {checkpoint_topology} does not match {args.topology}')
 
     model = IBPActionClassifier(
         embed_dim=ckpt_args.get('embed_dim', 256),
@@ -779,7 +786,7 @@ def main():
         n_expr_layers=ckpt_args.get('n_expr_layers', 2),
         n_cross_layers=ckpt_args.get('n_cross_layers', 2),
         n_subs_layers=ckpt_args.get('n_subs_layers', 2),
-        prime=ckpt_args.get('prime', args.prime)
+        prime=ckpt_args.get('prime', args.prime), topology=args.topology
     )
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
@@ -807,7 +814,7 @@ def main():
         target_sector=target_sector,
         filter_mode=args.filter_mode,
         n_workers=args.n_workers,
-        prime=args.prime
+        prime=args.prime, topology=args.topology
     )
 
     print('=' * 70, flush=True)
